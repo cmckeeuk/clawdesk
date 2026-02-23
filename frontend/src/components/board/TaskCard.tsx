@@ -40,7 +40,6 @@ export function TaskCard({
   const cardStyle = {
     ['--ticket-assignee-color' as string]: assigneeColor,
   } as CSSProperties
-  const description = ticket.description.trim()
 
   return (
     <div
@@ -78,7 +77,6 @@ export function TaskCard({
 
         <h4 className="ticket-title">{ticket.title}</h4>
 
-        {description ? <p className="ticket-description">{truncate(description, 160)}</p> : null}
 
         <p className="ticket-assignee-row">
           <span className="ticket-assignee-label">Assigned To</span>
@@ -127,13 +125,6 @@ function formatUpdatedAt(value: string): string {
   })
 }
 
-function truncate(value: string, maxLength: number): string {
-  if (value.length <= maxLength) {
-    return value
-  }
-
-  return `${value.slice(0, maxLength - 1)}…`
-}
 
 function assigneeToColor(assignee: string): string {
   const normalized = assignee.trim().toLowerCase()

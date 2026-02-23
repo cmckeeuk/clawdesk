@@ -509,13 +509,20 @@
   border-bottom: 1px solid var(--oc-color-border-soft);
 }
 
-.workspace-panel-head h3 {
+.workspace-panel-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  min-width: 0;
+}
+
+.workspace-panel-title h3 {
   margin: 0;
   font-size: var(--oc-font-size-300);
   color: var(--oc-color-text-primary);
 }
 
-.workspace-panel-head span {
+.workspace-panel-title span {
   display: inline-flex;
   min-width: 1.375rem;
   height: 1.375rem;
@@ -526,6 +533,62 @@
   justify-content: center;
   font-size: var(--oc-font-size-100);
   color: var(--oc-color-text-secondary);
+}
+
+.workspace-panel-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.38rem;
+}
+
+.workspace-panel-icon-btn {
+  appearance: none;
+  width: 1.42rem;
+  height: 1.42rem;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--oc-color-border-soft) 82%, white 18%);
+  background: linear-gradient(180deg, rgb(255 255 255 / 14%), rgb(255 255 255 / 4%));
+  color: var(--oc-color-text-secondary);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: transform var(--oc-transition-fast), box-shadow var(--oc-transition-fast), border-color var(--oc-transition-fast),
+    color var(--oc-transition-fast), background var(--oc-transition-fast);
+}
+
+.workspace-panel-icon-btn span {
+  font-size: 0.92rem;
+  line-height: 1;
+  font-weight: 600;
+}
+
+.workspace-panel-icon-btn:hover:not(:disabled) {
+  color: var(--oc-color-text-primary);
+  border-color: rgb(202 210 223 / 68%);
+  background: linear-gradient(180deg, rgb(255 255 255 / 22%), rgb(255 255 255 / 10%));
+  box-shadow: 0 0.18rem 0.5rem rgb(0 0 0 / 28%), inset 0 0.04rem 0.14rem rgb(255 255 255 / 24%);
+}
+
+.workspace-panel-icon-btn:active:not(:disabled) {
+  transform: translateY(0.03rem);
+  background: linear-gradient(180deg, rgb(255 255 255 / 8%), rgb(255 255 255 / 2%));
+}
+
+.workspace-panel-icon-btn:focus-visible {
+  outline: 2px solid rgb(78 149 255 / 70%);
+  outline-offset: 1px;
+}
+
+.workspace-panel-icon-btn-danger:hover:not(:disabled) {
+  color: #ff8f8f;
+  border-color: rgb(255 138 138 / 44%);
+}
+
+.workspace-panel-icon-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+  box-shadow: none;
 }
 
 .workspace-tree-scroll {
@@ -1814,6 +1877,10 @@
 
   .workspace-toolbar-actions {
     justify-content: flex-start;
+  }
+
+  .workspace-panel-head {
+    padding-right: 0;
   }
 
   .workspace-main {
