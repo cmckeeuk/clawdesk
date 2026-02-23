@@ -175,7 +175,7 @@ def init_db() -> None:
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               title TEXT NOT NULL,
               description TEXT DEFAULT '',
-              status TEXT NOT NULL DEFAULT 'Plan',
+              status TEXT NOT NULL DEFAULT 'Todo',
               assignee TEXT DEFAULT 'Unassigned',
               priority TEXT DEFAULT 'Medium',
               agent_session_key TEXT,
@@ -1357,7 +1357,7 @@ async def create_ticket(ticket: TicketCreate) -> Dict[str, Any]:
             INSERT INTO tickets (title, description, status, assignee, priority, archived_at, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (ticket.title, ticket.description, "Plan", ticket.assignee, ticket.priority, None, ts, ts),
+            (ticket.title, ticket.description, "Todo", ticket.assignee, ticket.priority, None, ts, ts),
         )
         ticket_id = cursor.lastrowid
 

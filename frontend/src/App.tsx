@@ -357,7 +357,7 @@ function AppShell() {
       id: temporaryId,
       title: payload.title,
       description: payload.description ?? '',
-      status: 'Plan',
+      status: 'Todo',
       assignee: payload.assignee ?? 'Unassigned',
       priority: payload.priority ?? 'Medium',
       agent_session_key: null,
@@ -368,12 +368,12 @@ function AppShell() {
 
     setPendingTickets((existing) => [temporaryTicket, ...existing])
     setIsNewTaskModalOpen(false)
-    showShellNotice('success', `Creating "${payload.title}" in Plan...`)
+    showShellNotice('success', `Creating "${payload.title}" in Todo...`)
 
     try {
       const created = await createTicketMutation.mutate(payload)
       setPendingTickets((existing) => existing.filter((ticket) => ticket.id !== temporaryId))
-      showShellNotice('success', `Created TASK-${created.id} in Plan.`)
+      showShellNotice('success', `Created TASK-${created.id} in Todo.`)
       setIsNewTaskModalOpen(false)
       setRefreshToken((value) => value + 1)
     } catch (error) {
@@ -1334,7 +1334,6 @@ function collectMoveWarnings(response: { warnings: string[]; pickup: { spawned: 
 }
 
 function DragTicketOverlay({ ticket, warnings }: { ticket: Ticket; warnings: string[] }) {
-  const description = ticket.description.trim()
   const assigneeColor = assigneeToColor(ticket.assignee)
   const overlayStyle = {
     ['--ticket-assignee-color' as string]: assigneeColor,
@@ -1349,7 +1348,6 @@ function DragTicketOverlay({ ticket, warnings }: { ticket: Ticket; warnings: str
 
       <h4 className="ticket-title">{ticket.title}</h4>
 
-      {description ? <p className="ticket-description">{truncateText(description, 160)}</p> : null}
 
       <p className="ticket-assignee-row">
         <span className="ticket-assignee-label">Assigned To</span>
@@ -1397,13 +1395,6 @@ function formatUpdatedAtDisplay(value: string): string {
   })
 }
 
-function truncateText(value: string, maxLength: number): string {
-  if (value.length <= maxLength) {
-    return value
-  }
-
-  return `${value.slice(0, maxLength - 1)}…`
-}
 
 function assigneeToColor(assignee: string): string {
   const normalized = assignee.trim().toLowerCase()

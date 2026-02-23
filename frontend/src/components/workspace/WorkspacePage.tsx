@@ -50,6 +50,7 @@ export function WorkspacePage({ searchValue, refreshToken, notify }: WorkspacePa
   const saveFileMutation = useUpdateWorkspaceFileMutation()
 
   const [selectedFilePath, setSelectedFilePath] = useState<string | null>(null)
+  const [activeDirectoryPath, setActiveDirectoryPath] = useState<string>(ROOT_PATH)
   const [fileRefreshToken, setFileRefreshToken] = useState(0)
   const [viewMode, setViewMode] = useState<WorkspaceViewMode>('split')
   const [treePanelWidth, setTreePanelWidth] = useState(320)
@@ -378,6 +379,7 @@ export function WorkspacePage({ searchValue, refreshToken, notify }: WorkspacePa
         }
       }
 
+      setActiveDirectoryPath(workspaceParentPath(normalizedPath))
       setSelectedFilePath(normalizedPath)
       setFileRefreshToken((value) => value + 1)
       consumedOpenPathRef.current = normalizedPath
@@ -403,6 +405,7 @@ export function WorkspacePage({ searchValue, refreshToken, notify }: WorkspacePa
   }, [loadDirectory, searchParams, setSearchParams])
 
   const handleToggleDirectory = (path: string) => {
+    setActiveDirectoryPath(path)
     setExpandedDirectories((current) => {
       const next = new Set(current)
       if (next.has(path)) {
@@ -419,6 +422,8 @@ export function WorkspacePage({ searchValue, refreshToken, notify }: WorkspacePa
     if (selectedFilePath === path) {
       return
     }
+
+    setActiveDirectoryPath(workspaceParentPath(path))
 
     if (hasUnsavedChanges) {
       const proceed = window.confirm('Discard unsaved changes and open another file?')
@@ -455,7 +460,8 @@ export function WorkspacePage({ searchValue, refreshToken, notify }: WorkspacePa
     }
 
     const selectedPath = selectedFilePath ? normalizeWorkspacePath(selectedFilePath) : ''
-    const defaultParent = selectedPath ? workspaceParentPath(selectedPath) : ROOT_PATH
+    const activePath = normalizeWorkspacePath(activeDirectoryPath)
+    const defaultParent = selectedPath ? workspaceParentPath(selectedPath) : activePath || ROOT_PATH
     const defaultPath = defaultParent ? `${defaultParent}/untitled.md` : 'untitled.md'
     const rawInput = window.prompt('Enter new file path (workspace-relative):', defaultPath)
     if (rawInput === null) {
@@ -490,6 +496,7 @@ export function WorkspacePage({ searchValue, refreshToken, notify }: WorkspacePa
         }
       }
 
+      setActiveDirectoryPath(workspaceParentPath(response.path))
       setSelectedFilePath(response.path)
       setFileRefreshToken((value) => value + 1)
       notify('success', `Created ${response.path}.`)
@@ -519,8 +526,10 @@ export function WorkspacePage({ searchValue, refreshToken, notify }: WorkspacePa
       failedAutoSaveVersionRef.current = null
 
       if (response.parentPath) {
+        setActiveDirectoryPath(response.parentPath)
         await loadDirectory(response.parentPath, true)
       } else {
+        setActiveDirectoryPath(ROOT_PATH)
         await rootQuery.refetch()
       }
 
@@ -793,25 +802,11 @@ export function WorkspacePage({ searchValue, refreshToken, notify }: WorkspacePa
                 </>
               ) : null}
             </div>
-            <Button
-              variant="ghost"
-              onClick={handleCreateFile}
-              disabled={createFileMutation.isPending || saveFileMutation.isPending || deleteFileMutation.isPending}
-            >
-              {createFileMutation.isPending ? 'Creating...' : 'New File'}
-            </Button>
             <Button variant="ghost" onClick={handleRefreshWorkspace}>
               Refresh Files
             </Button>
             <Button variant="ghost" onClick={handleRevert} disabled={!isEditableFile || !hasUnsavedChanges || saveFileMutation.isPending}>
               Revert
-            </Button>
-            <Button
-              variant="danger"
-              onClick={handleDeleteFile}
-              disabled={!selectedFilePath || deleteFileMutation.isPending || saveFileMutation.isPending}
-            >
-              {deleteFileMutation.isPending ? 'Deleting...' : 'Delete File'}
             </Button>
             <Button
               variant="primary"
@@ -830,8 +825,32 @@ export function WorkspacePage({ searchValue, refreshToken, notify }: WorkspacePa
         >
           <aside className="workspace-tree-panel" aria-label="Workspace tree">
             <header className="workspace-panel-head">
-              <h3>Workspace Files</h3>
-              <span>{rootEntries.length}</span>
+              <div className="workspace-panel-title">
+                <h3>Workspace Files</h3>
+                <span>{rootEntries.length}</span>
+              </div>
+              <div className="workspace-panel-actions" role="group" aria-label="File actions">
+                <button
+                  type="button"
+                  className="workspace-panel-icon-btn"
+                  onClick={handleCreateFile}
+                  disabled={createFileMutation.isPending || saveFileMutation.isPending || deleteFileMutation.isPending}
+                  aria-label={createFileMutation.isPending ? 'Creating file' : 'Create new file'}
+                  title={createFileMutation.isPending ? 'Creating file…' : 'New file'}
+                >
+                  <span aria-hidden="true">{createFileMutation.isPending ? '…' : '+'}</span>
+                </button>
+                <button
+                  type="button"
+                  className="workspace-panel-icon-btn workspace-panel-icon-btn-danger"
+                  onClick={handleDeleteFile}
+                  disabled={!selectedFilePath || deleteFileMutation.isPending || saveFileMutation.isPending}
+                  aria-label={deleteFileMutation.isPending ? 'Deleting file' : 'Delete selected file'}
+                  title={deleteFileMutation.isPending ? 'Deleting file…' : 'Delete selected file'}
+                >
+                  <span aria-hidden="true">{deleteFileMutation.isPending ? '…' : '−'}</span>
+                </button>
+              </div>
             </header>
             <div className="workspace-tree-scroll">
               {rootQuery.uiError ? (
