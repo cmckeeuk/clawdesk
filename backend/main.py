@@ -768,6 +768,82 @@ async def resolve_assignee_agent_id(assignee: str) -> Optional[str]:
     return await resolve_assignee_agent_id_from_directory(assignee)
 
 
+def parse_sessions_list_response(response: Dict[str, Any]) -> List[Dict[str, Any]]:
+    result = response.get("result", {}) if isinstance(response, dict) else {}
+    if not isinstance(result, dict):
+        return []
+
+    details = result.get("details")
+    if isinstance(details, dict):
+        for key in ("sessions", "items"):
+            items = details.get(key)
+            if isinstance(items, list):
+                return [item for item in items if isinstance(item, dict)]
+
+    content = result.get("content")
+    if isinstance(content, list):
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            text = item.get("text")
+            if not isinstance(text, str):
+                continue
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                for key in ("sessions", "items"):
+                    items = parsed.get(key)
+                    if isinstance(items, list):
+                        return [entry for entry in items if isinstance(entry, dict)]
+            if isinstance(parsed, list):
+                return [entry for entry in parsed if isinstance(entry, dict)]
+
+    return []
+
+
+async def is_session_live(session_key: str) -> Dict[str, Any]:
+    key = session_key.strip()
+    if not key:
+        return {"attempted": False, "live": False, "reason": "Empty session key"}
+
+    try:
+        response = await call_openclaw_tool(
+            "sessions_list",
+            {"limit": 200, "messageLimit": 0},
+            timeout_seconds=20.0,
+        )
+    except HTTPException as exc:
+        return {"attempted": True, "live": False, "reason": str(exc.detail)}
+
+    sessions = parse_sessions_list_response(response)
+    if not sessions:
+        return {"attempted": True, "live": False, "reason": "No sessions returned by gateway"}
+
+    for session in sessions:
+        candidate = str(
+            session.get("sessionKey")
+            or session.get("key")
+            or session.get("id")
+            or ""
+        ).strip()
+        if candidate != key:
+            continue
+
+        status = str(session.get("status") or session.get("state") or "").strip().lower()
+        if status in {"", "running", "active", "idle", "queued", "started"}:
+            return {"attempted": True, "live": True, "status": status or "unknown"}
+        return {
+            "attempted": True,
+            "live": False,
+            "reason": f"Session present but not live (status={status})",
+            "status": status,
+        }
+
+    return {"attempted": True, "live": False, "reason": "Session key not found"}
+
+
 def build_spawn_prompt(ticket: Dict[str, Any], status: str) -> str:
     status_instruction = (
         "Perform planning and analysis only, then move the ticket to Review when planning is complete."
@@ -883,6 +959,25 @@ async def spawn_agent_for_ticket(ticket: Dict[str, Any], status: str) -> Dict[st
     }
 
 
+async def ensure_agent_session(ticket: Dict[str, Any], status: str) -> Dict[str, Any]:
+    existing_key = str(ticket.get("agent_session_key") or "").strip()
+    if existing_key:
+        live = await is_session_live(existing_key)
+        if live.get("live"):
+            return {
+                "attempted": True,
+                "spawned": False,
+                "reused": True,
+                "session_key": existing_key,
+                "reason": "Reused existing live session",
+            }
+
+    spawn = await spawn_agent_for_ticket(ticket, status)
+    if spawn.get("spawned"):
+        spawn["reused"] = False
+    return spawn
+
+
 def build_comment_followup_prompt(ticket: Dict[str, Any], comment: Dict[str, Any]) -> str:
     return (
         f"Ticket #{ticket['id']} received a new comment.\n\n"
@@ -913,17 +1008,50 @@ async def notify_agent_on_comment(ticket: Dict[str, Any], comment: Dict[str, Any
     if assignee and author and assignee == author:
         return {"attempted": False, "notified": False, "reason": "Comment authored by assignee"}
 
+    prompt = build_comment_followup_prompt(ticket, comment)
     payload_args = {
         "sessionKey": session_key,
-        "message": build_comment_followup_prompt(ticket, comment),
+        "message": prompt,
         "timeoutSeconds": 90,
     }
 
     try:
         await call_openclaw_tool("sessions_send", payload_args, timeout_seconds=30.0)
         return {"attempted": True, "notified": True, "session_key": session_key}
-    except HTTPException as exc:
-        return {"attempted": True, "notified": False, "reason": str(exc.detail), "session_key": session_key}
+    except HTTPException as first_exc:
+        respawn = await spawn_agent_for_ticket(ticket, status)
+        if not respawn.get("spawned"):
+            return {
+                "attempted": True,
+                "notified": False,
+                "reason": f"Notify failed: {first_exc.detail}; respawn failed: {respawn.get('reason', 'unknown')}",
+                "session_key": session_key,
+            }
+
+        retry_key = str(respawn.get("session_key") or "").strip()
+        retry_payload = {
+            "sessionKey": retry_key,
+            "message": prompt,
+            "timeoutSeconds": 90,
+        }
+        try:
+            await call_openclaw_tool("sessions_send", retry_payload, timeout_seconds=30.0)
+            return {
+                "attempted": True,
+                "notified": True,
+                "session_key": retry_key,
+                "respawned": True,
+                "previous_session_key": session_key,
+            }
+        except HTTPException as retry_exc:
+            return {
+                "attempted": True,
+                "notified": False,
+                "reason": f"Notify failed: {first_exc.detail}; retry after respawn failed: {retry_exc.detail}",
+                "session_key": retry_key,
+                "respawned": True,
+                "previous_session_key": session_key,
+            }
 
 
 def validate_transition(current_status: str, target_status: str) -> None:
@@ -1501,10 +1629,19 @@ async def move_ticket(ticket_id: int, status: str, actor: str = "User") -> Dict[
         updated = row_to_dict(conn.execute("SELECT * FROM tickets WHERE id = ?", (ticket_id,)).fetchone())
 
         if old_status != status and status in AUTOMATION_TRIGGER_STATUSES:
-            spawn = await spawn_agent_for_ticket(updated, status)
-            pickup = spawn
-            if spawn.get("spawned"):
-                session_key = spawn.get("session_key")
+            session_result = await ensure_agent_session(updated, status)
+            pickup = session_result
+            if session_result.get("reused"):
+                reuse_event = create_event(
+                    conn,
+                    ticket_id,
+                    "agent_reused",
+                    actor,
+                    f"Reused existing session {session_result.get('session_key')} on status {status}",
+                )
+                events_to_broadcast.append(reuse_event)
+            elif session_result.get("spawned"):
+                session_key = session_result.get("session_key")
                 conn.execute(
                     "UPDATE tickets SET agent_session_key = ?, updated_at = ? WHERE id = ?",
                     (session_key, now_iso(), ticket_id),
@@ -1514,7 +1651,7 @@ async def move_ticket(ticket_id: int, status: str, actor: str = "User") -> Dict[
                     ticket_id,
                     "agent_spawned",
                     actor,
-                    f"Assignee {updated['assignee']} mapped to {spawn.get('agent_id')} session={session_key} on status {status}",
+                    f"Assignee {updated['assignee']} mapped to {session_result.get('agent_id')} session={session_key} on status {status}",
                 )
                 comment = create_comment(
                     conn,
@@ -1525,12 +1662,32 @@ async def move_ticket(ticket_id: int, status: str, actor: str = "User") -> Dict[
                 comments_to_broadcast.append(comment)
                 events_to_broadcast.append(spawn_event)
             else:
-                reason = spawn.get("reason", "unknown")
+                reason = session_result.get("reason", "unknown")
                 warnings.append(reason)
                 failure_event = create_event(conn, ticket_id, "agent_spawn_failed", actor, reason)
                 comment = create_comment(conn, ticket_id, "System", f"Agent pickup failed: {reason}")
                 comments_to_broadcast.append(comment)
                 events_to_broadcast.append(failure_event)
+
+        if (
+            old_status != status
+            and old_status in AUTOMATION_TRIGGER_STATUSES
+            and status not in AUTOMATION_TRIGGER_STATUSES
+            and str(updated.get("agent_session_key") or "").strip()
+        ):
+            previous_session_key = str(updated.get("agent_session_key") or "").strip()
+            conn.execute(
+                "UPDATE tickets SET agent_session_key = NULL, updated_at = ? WHERE id = ?",
+                (now_iso(), ticket_id),
+            )
+            deactivate_event = create_event(
+                conn,
+                ticket_id,
+                "agent_session_deactivated",
+                actor,
+                f"Cleared active routing session {previous_session_key} after move {old_status} -> {status}",
+            )
+            events_to_broadcast.append(deactivate_event)
 
         conn.commit()
         final_ticket = row_to_dict(conn.execute("SELECT * FROM tickets WHERE id = ?", (ticket_id,)).fetchone())
@@ -1587,10 +1744,24 @@ async def add_ticket_comment(ticket_id: int, comment: CommentCreate) -> Dict[str
         conn.commit()
 
     followup_event: Optional[Dict[str, Any]] = None
+    respawn_event: Optional[Dict[str, Any]] = None
     if current_ticket is not None:
         notify_result = await notify_agent_on_comment(current_ticket, created)
         if notify_result.get("attempted"):
             with get_db() as conn:
+                if notify_result.get("respawned") and notify_result.get("session_key"):
+                    conn.execute(
+                        "UPDATE tickets SET agent_session_key = ?, updated_at = ? WHERE id = ?",
+                        (notify_result.get("session_key"), now_iso(), ticket_id),
+                    )
+                    respawn_event = create_event(
+                        conn,
+                        ticket_id,
+                        "agent_respawned_after_notify_failure",
+                        "System",
+                        f"Replaced session {notify_result.get('previous_session_key')} with {notify_result.get('session_key')}",
+                    )
+
                 if notify_result.get("notified"):
                     followup_event = create_event(
                         conn,
@@ -1611,6 +1782,8 @@ async def add_ticket_comment(ticket_id: int, comment: CommentCreate) -> Dict[str
 
     await manager.broadcast({"type": "comment_added", "ticket_id": ticket_id, "comment": created})
     await manager.broadcast({"type": "ticket_event", "event": event})
+    if respawn_event is not None:
+        await manager.broadcast({"type": "ticket_event", "event": respawn_event})
     if followup_event is not None:
         await manager.broadcast({"type": "ticket_event", "event": followup_event})
     return created
