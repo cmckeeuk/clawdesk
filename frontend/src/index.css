@@ -1,0 +1,28 @@
+:root {
+  color-scheme: dark;
+  font-family: var(--oc-font-family-base);
+  line-height: 1.5;
+  font-weight: var(--oc-font-weight-regular);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 20rem;
+  min-height: 100vh;
+  background: var(--oc-color-bg-app);
+  color: var(--oc-color-text-primary);
+}
+
+#root {
+  min-height: 100vh;
+}

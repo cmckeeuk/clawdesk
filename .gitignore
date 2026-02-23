@@ -1,0 +1,76 @@
+# -----------------------------
+# OS / editor noise
+# -----------------------------
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# -----------------------------
+# Python backend
+# -----------------------------
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+
+.venv/
+venv/
+ENV/
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# -----------------------------
+# Frontend (Vite / Node)
+# -----------------------------
+frontend/node_modules/
+frontend/dist/
+frontend/dist-ssr/
+frontend/.vite/
+frontend/.cache/
+
+frontend/npm-debug.log*
+frontend/yarn-debug.log*
+frontend/yarn-error.log*
+frontend/pnpm-debug.log*
+
+# -----------------------------
+# Environment / secrets
+# -----------------------------
+.env
+.env.*
+!.env.example
+
+frontend/.env
+frontend/.env.*
+!frontend/.env.example
+
+# -----------------------------
+# Local runtime data
+# -----------------------------
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+data/*.db-*
+data/*.log
+
+*.pid
+*.pid.lock
+
+# -----------------------------
+# Temp / cache
+# -----------------------------
+tmp/
+temp/
+.cache/
+*.tmp

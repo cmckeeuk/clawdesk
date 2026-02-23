@@ -1,0 +1,65 @@
+:root {
+  --oc-color-bg-app: #18191c;
+  --oc-color-bg-app-accent-a: rgb(0 0 0 / 0%);
+  --oc-color-bg-app-accent-b: rgb(0 0 0 / 0%);
+  --oc-color-bg-sidebar-top: #0c0c0e;
+  --oc-color-bg-sidebar-bottom: #2a2c31;
+  --oc-color-bg-panel: #1b1b1f;
+  --oc-color-bg-panel-soft: #33363d;
+  --oc-color-bg-input: #191b1f;
+  --oc-color-bg-chip: #383d46;
+  --oc-color-bg-editor: #121316;
+  --oc-color-bg-active: rgb(255 255 255 / 10%);
+  --oc-color-bg-active-border: rgb(198 205 218 / 45%);
+  --oc-color-bg-hover: rgb(255 255 255 / 7%);
+
+  --oc-color-text-primary: #eceff5;
+  --oc-color-text-secondary: #b9c0cb;
+  --oc-color-text-muted: #8a93a2;
+  --oc-color-text-on-accent: #f4f7ff;
+  --oc-color-text-avatar: #111419;
+
+  --oc-color-border-strong: rgb(171 180 194 / 34%);
+  --oc-color-border-soft: rgb(163 172 186 / 22%);
+  --oc-color-border-hover: rgb(190 199 214 / 58%);
+
+  --oc-color-accent: #3a80ff;
+  --oc-color-accent-strong: #2d69dd;
+  --oc-color-accent-deep: #2f6ce3;
+  --oc-color-success: #22c55e;
+  --oc-color-danger: #ef4444;
+  --oc-color-warning: #f59e0b;
+  --oc-color-avatar-start: #b1b8c4;
+  --oc-color-avatar-end: #d0d6de;
+  --oc-color-card-start: #2a2c31;
+  --oc-color-card-end: #2a2c31;
+
+  --oc-font-family-base: 'Space Grotesk', 'Avenir Next', 'Segoe UI', sans-serif;
+  --oc-font-size-100: 0.75rem;
+  --oc-font-size-200: 0.83rem;
+  --oc-font-size-300: 0.9rem;
+  --oc-font-size-400: 1rem;
+  --oc-font-size-500: 1.08rem;
+  --oc-font-size-600: 1.3rem;
+  --oc-font-size-700: 1.65rem;
+
+  --oc-font-weight-regular: 400;
+  --oc-font-weight-medium: 500;
+  --oc-font-weight-semibold: 600;
+  --oc-font-weight-bold: 700;
+
+  --oc-space-1: 0.25rem;
+  --oc-space-2: 0.5rem;
+  --oc-space-3: 0.75rem;
+  --oc-space-4: 1rem;
+  --oc-space-5: 1.25rem;
+  --oc-space-6: 1.5rem;
+
+  --oc-radius-sm: 0.5rem;
+  --oc-radius-md: 0.75rem;
+  --oc-radius-lg: 0.875rem;
+  --oc-radius-pill: 999px;
+
+  --oc-shadow-sm: 0 8px 20px rgb(0 0 0 / 28%);
+  --oc-transition-fast: 160ms ease;
+}
