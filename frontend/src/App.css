@@ -536,9 +536,57 @@
 }
 
 .workspace-panel-actions {
+  position: relative;
   display: inline-flex;
   align-items: center;
   gap: 0.38rem;
+}
+
+.workspace-delete-confirm {
+  position: absolute;
+  top: calc(100% + 0.45rem);
+  right: 0;
+  width: min(16.5rem, 80vw);
+  border-radius: var(--oc-radius-md);
+  border: 1px solid rgb(255 148 148 / 32%);
+  background: color-mix(in srgb, var(--oc-color-bg-panel) 94%, #201314 6%);
+  box-shadow: 0 0.65rem 1.4rem rgb(0 0 0 / 42%);
+  padding: 0.62rem;
+  z-index: 5;
+}
+
+.workspace-delete-confirm p {
+  margin: 0;
+  font-size: var(--oc-font-size-200);
+  line-height: 1.35;
+}
+
+.workspace-delete-confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.45rem;
+  margin-top: 0.55rem;
+}
+
+.workspace-delete-cancel,
+.workspace-delete-accept {
+  appearance: none;
+  border-radius: var(--oc-radius-sm);
+  border: 1px solid var(--oc-color-border-soft);
+  padding: 0.28rem 0.56rem;
+  font-size: var(--oc-font-size-100);
+  cursor: pointer;
+}
+
+.workspace-delete-cancel {
+  background: color-mix(in srgb, var(--oc-color-bg-panel) 88%, black 12%);
+  color: var(--oc-color-text-secondary);
+}
+
+.workspace-delete-accept {
+  background: #5b1c1c;
+  border-color: rgb(255 134 134 / 38%);
+  color: #ffd9d9;
 }
 
 .workspace-panel-icon-btn {

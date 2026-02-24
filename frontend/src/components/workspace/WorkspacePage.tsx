@@ -33,6 +33,11 @@ type ResizeState = {
   valueStart: number
 }
 type AutoSaveState = 'idle' | 'dirty' | 'saving' | 'saved' | 'error'
+type DeleteConfirmState = {
+  path: string
+  name: string
+  type: 'file' | 'dir'
+}
 
 const ROOT_PATH = ''
 const MARKDOWN_TOOLBAR_ITEMS = [
@@ -42,6 +47,8 @@ const MARKDOWN_TOOLBAR_ITEMS = [
   ['table', 'link', 'image'],
   ['code', 'codeblock'],
 ]
+
+const MARKDOWN_PATH_PATTERN = /\.(md|markdown|mdx)$/i
 
 export function WorkspacePage({ searchValue, refreshToken, notify }: WorkspacePageProps) {
   const rootQuery = useWorkspaceDirectoryQuery(ROOT_PATH, refreshToken, false)
@@ -64,6 +71,7 @@ export function WorkspacePage({ searchValue, refreshToken, notify }: WorkspacePa
   const [resizeState, setResizeState] = useState<ResizeState | null>(null)
   const [autoSaveState, setAutoSaveState] = useState<AutoSaveState>('idle')
   const [lastAutoSavedAt, setLastAutoSavedAt] = useState<Date | null>(null)
+  const [deleteConfirmState, setDeleteConfirmState] = useState<DeleteConfirmState | null>(null)
   const [draftVersion, setDraftVersion] = useState(0)
   const [savedVersion, setSavedVersion] = useState(0)
   const [searchParams, setSearchParams] = useSearchParams()
@@ -263,6 +271,28 @@ export function WorkspacePage({ searchValue, refreshToken, notify }: WorkspacePa
   const rootEntries = useMemo(() => {
     return directoryCache.get(ROOT_PATH) ?? rootQuery.data?.entries ?? []
   }, [directoryCache, rootQuery.data?.entries])
+  const selectedFileParentPath = selectedFilePath ? workspaceParentPath(selectedFilePath) : null
+  const hasExplicitDirectorySelection = Boolean(
+    activeDirectoryPath &&
+      activeDirectoryPath !== ROOT_PATH &&
+      (!selectedFileParentPath || activeDirectoryPath !== selectedFileParentPath),
+  )
+  const canDeleteSelectedDirectory = Boolean(activeDirectoryPath && activeDirectoryPath !== ROOT_PATH)
+  const deleteTarget = hasExplicitDirectorySelection
+    ? {
+        path: activeDirectoryPath,
+        name: activeDirectoryPath.split('/').pop() ?? activeDirectoryPath,
+        type: 'dir' as const,
+      }
+    : selectedFilePath
+      ? { path: selectedFilePath, name: selectedFilePath.split('/').pop() ?? selectedFilePath, type: 'file' as const }
+      : canDeleteSelectedDirectory
+        ? {
+            path: activeDirectoryPath,
+            name: activeDirectoryPath.split('/').pop() ?? activeDirectoryPath,
+            type: 'dir' as const,
+          }
+        : null
 
   const isDirectoryVisible = useCallback(
     (entry: WorkspaceEntry): boolean => {
@@ -380,6 +410,7 @@ export function WorkspacePage({ searchValue, refreshToken, notify }: WorkspacePa
       }
 
       setActiveDirectoryPath(workspaceParentPath(normalizedPath))
+      setViewMode(MARKDOWN_PATH_PATTERN.test(normalizedPath) ? 'preview' : 'split')
       setSelectedFilePath(normalizedPath)
       setFileRefreshToken((value) => value + 1)
       consumedOpenPathRef.current = normalizedPath
@@ -405,6 +436,7 @@ export function WorkspacePage({ searchValue, refreshToken, notify }: WorkspacePa
   }, [loadDirectory, searchParams, setSearchParams])
 
   const handleToggleDirectory = (path: string) => {
+    setDeleteConfirmState(null)
     setActiveDirectoryPath(path)
     setExpandedDirectories((current) => {
       const next = new Set(current)
@@ -419,6 +451,7 @@ export function WorkspacePage({ searchValue, refreshToken, notify }: WorkspacePa
   }
 
   const handleSelectFile = (path: string) => {
+    setDeleteConfirmState(null)
     if (selectedFilePath === path) {
       return
     }
@@ -434,6 +467,7 @@ export function WorkspacePage({ searchValue, refreshToken, notify }: WorkspacePa
 
     setDraftContent('')
     setSavedContent('')
+    setViewMode(MARKDOWN_PATH_PATTERN.test(path) ? 'preview' : 'split')
     setSelectedFilePath(path)
     setFileRefreshToken((value) => value + 1)
   }
@@ -506,18 +540,22 @@ export function WorkspacePage({ searchValue, refreshToken, notify }: WorkspacePa
     }
   }
 
-  const handleDeleteFile = async () => {
-    if (!selectedFilePath) {
+  const handleDeleteFile = () => {
+    if (!deleteTarget) {
       return
     }
 
-    const confirmDelete = window.confirm(`Delete file "${selectedFilePath}"?`)
-    if (!confirmDelete) {
+    setDeleteConfirmState(deleteTarget)
+  }
+
+  const handleConfirmDelete = async () => {
+    if (!deleteConfirmState) {
       return
     }
 
     try {
-      const response = await deleteFileMutation.mutate({ path: selectedFilePath })
+      const response = await deleteFileMutation.mutate({ path: deleteConfirmState.path })
+      setDeleteConfirmState(null)
       setSelectedFilePath(null)
       setDraftContent('')
       setSavedContent('')
@@ -535,7 +573,7 @@ export function WorkspacePage({ searchValue, refreshToken, notify }: WorkspacePa
 
       notify('success', `Deleted ${response.path}.`)
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Failed to delete file.'
+      const message = error instanceof Error ? error.message : `Failed to delete ${deleteConfirmState.type}.`
       notify('error', message)
     }
   }
@@ -722,6 +760,8 @@ export function WorkspacePage({ searchValue, refreshToken, notify }: WorkspacePa
           const childEntries = isDirectory ? directoryCache.get(entry.path) ?? [] : []
           const directoryError = isDirectory ? directoryErrors.get(entry.path) : null
           const isSelectedFile = !isDirectory && selectedFilePath === entry.path
+          const isSelectedDirectory =
+            isDirectory && activeDirectoryPath === entry.path && (!selectedFilePath || hasExplicitDirectorySelection)
 
           return (
             <li key={entry.path}>
@@ -730,7 +770,7 @@ export function WorkspacePage({ searchValue, refreshToken, notify }: WorkspacePa
                 className={cn(
                   'workspace-tree-row',
                   isDirectory && 'workspace-tree-row-dir',
-                  isSelectedFile && 'workspace-tree-row-selected',
+                  (isSelectedFile || isSelectedDirectory) && 'workspace-tree-row-selected',
                 )}
                 onClick={() => {
                   if (isDirectory) {
@@ -844,12 +884,33 @@ export function WorkspacePage({ searchValue, refreshToken, notify }: WorkspacePa
                   type="button"
                   className="workspace-panel-icon-btn workspace-panel-icon-btn-danger"
                   onClick={handleDeleteFile}
-                  disabled={!selectedFilePath || deleteFileMutation.isPending || saveFileMutation.isPending}
-                  aria-label={deleteFileMutation.isPending ? 'Deleting file' : 'Delete selected file'}
-                  title={deleteFileMutation.isPending ? 'Deleting file…' : 'Delete selected file'}
+                  disabled={!deleteTarget || deleteFileMutation.isPending || saveFileMutation.isPending}
+                  aria-label={deleteFileMutation.isPending ? 'Deleting selection' : 'Delete selected file or folder'}
+                  title={
+                    deleteFileMutation.isPending
+                      ? 'Deleting…'
+                      : deleteTarget?.type === 'dir'
+                        ? 'Delete selected folder'
+                        : 'Delete selected file'
+                  }
                 >
                   <span aria-hidden="true">{deleteFileMutation.isPending ? '…' : '−'}</span>
                 </button>
+                {deleteConfirmState ? (
+                  <div className="workspace-delete-confirm" role="dialog" aria-modal="false" aria-label="Confirm delete">
+                    <p>
+                      Delete {deleteConfirmState.type === 'dir' ? 'folder' : 'file'} <strong>{deleteConfirmState.name}</strong>?
+                    </p>
+                    <div className="workspace-delete-confirm-actions">
+                      <button type="button" className="workspace-delete-cancel" onClick={() => setDeleteConfirmState(null)}>
+                        Cancel
+                      </button>
+                      <button type="button" className="workspace-delete-accept" onClick={handleConfirmDelete}>
+                        Delete
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
               </div>
             </header>
             <div className="workspace-tree-scroll">

@@ -5,6 +5,7 @@ import re
 import sqlite3
 import asyncio
 import tempfile
+import shutil
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,7 +23,7 @@ from pydantic import BaseModel, field_validator
 BASE_DIR = Path(__file__).resolve().parents[1]
 FRONTEND_DIST_DIR = BASE_DIR / "frontend" / "dist"
 DATA_DIR = BASE_DIR / "data"
-DB_PATH = DATA_DIR / "kanban.db"
+DEFAULT_DB_PATH = DATA_DIR / "kanban.db"
 DOTENV_PATH = BASE_DIR / ".env"
 
 DATA_DIR.mkdir(exist_ok=True)
@@ -54,6 +55,9 @@ def now_iso() -> str:
 
 
 load_dotenv(DOTENV_PATH)
+
+DB_PATH = Path(os.getenv("KANBAN_DB_PATH", str(DEFAULT_DB_PATH))).expanduser().resolve()
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 
 def infer_port(default: int = 8080) -> int:
@@ -1379,24 +1383,29 @@ def delete_workspace_file(path: str) -> Dict[str, Any]:
     if not WORKSPACE_ROOT.exists() or not WORKSPACE_ROOT.is_dir():
         raise HTTPException(status_code=500, detail=f"Workspace root is unavailable: {WORKSPACE_ROOT}")
 
-    file_path = resolve_workspace_path(path)
-    if not file_path.exists():
-        raise HTTPException(status_code=404, detail="file not found")
-    if not file_path.is_file():
-        raise HTTPException(status_code=400, detail="path is not a file")
+    target_path = resolve_workspace_path(path)
+    if target_path == WORKSPACE_ROOT:
+        raise HTTPException(status_code=400, detail="cannot delete workspace root")
+    if not target_path.exists():
+        raise HTTPException(status_code=404, detail="path not found")
 
     try:
-        file_path.unlink()
+        if target_path.is_file() or target_path.is_symlink():
+            target_path.unlink()
+        elif target_path.is_dir():
+            shutil.rmtree(target_path)
+        else:
+            raise HTTPException(status_code=400, detail="path is not a file or directory")
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=f"Permission denied: {exc}") from exc
     except OSError as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to delete file: {exc}") from exc
+        raise HTTPException(status_code=500, detail=f"Failed to delete path: {exc}") from exc
 
-    parent_path = workspace_relative(file_path.parent) if file_path.parent != WORKSPACE_ROOT else ""
+    parent_path = workspace_relative(target_path.parent) if target_path.parent != WORKSPACE_ROOT else ""
     return {
         "ok": True,
-        "path": workspace_relative(file_path),
-        "name": file_path.name,
+        "path": workspace_relative(target_path),
+        "name": target_path.name,
         "parentPath": parent_path,
     }
 

@@ -162,6 +162,7 @@ function EditTicketPanelForm({
   const commentLength = commentDraft.trim().length
   const comments = commentsQuery.data ?? []
   const events = eventsQuery.data ?? []
+  const activityEntries = buildTicketActivityEntries(events, comments)
   const taskDocs = docsQuery.data
   const taskDocFiles = taskDocs?.files ?? []
   const drawerStyle = { '--drawer-width': `${drawerWidth}px` } as CSSProperties
@@ -464,14 +465,17 @@ function EditTicketPanelForm({
           ) : null}
 
           {activeTab === 'activity' ? (
-            <TabEventList
-              isLoading={eventsQuery.isLoading}
+            <TabActivityList
+              isLoading={eventsQuery.isLoading || commentsQuery.isLoading}
               errorMessage={
-                eventsQuery.uiError ? `${eventsQuery.uiError.title}: ${eventsQuery.uiError.message}` : null
+                eventsQuery.uiError
+                  ? `${eventsQuery.uiError.title}: ${eventsQuery.uiError.message}`
+                  : commentsQuery.uiError
+                    ? `${commentsQuery.uiError.title}: ${commentsQuery.uiError.message}`
+                    : null
               }
               emptyMessage="No activity entries yet."
-              events={events}
-              formatter={formatActivityEvent}
+              entries={activityEntries}
             />
           ) : null}
         </section>
@@ -537,6 +541,79 @@ function TabEventList({
       })}
     </ul>
   )
+}
+
+type TicketActivityEntry = {
+  id: string
+  createdAt: string
+  title: string
+  detail: string
+}
+
+function TabActivityList({
+  isLoading,
+  errorMessage,
+  emptyMessage,
+  entries,
+}: {
+  isLoading: boolean
+  errorMessage: string | null
+  emptyMessage: string
+  entries: TicketActivityEntry[]
+}) {
+  if (errorMessage) {
+    return <p className="panel-inline-error">{errorMessage}</p>
+  }
+
+  if (isLoading) {
+    return <p className="panel-inline-muted">Loading...</p>
+  }
+
+  if (entries.length === 0) {
+    return <p className="panel-inline-muted">{emptyMessage}</p>
+  }
+
+  return (
+    <ul className="event-list">
+      {entries.map((entry) => (
+        <li key={entry.id} className="event-row">
+          <div className="event-row-head">
+            <p className="event-row-title">{entry.title}</p>
+            <time className="event-row-time" dateTime={entry.createdAt}>
+              {formatDateTime(entry.createdAt)}
+            </time>
+          </div>
+          <p className="event-row-detail">{entry.detail}</p>
+        </li>
+      ))}
+    </ul>
+  )
+}
+
+function buildTicketActivityEntries(events: TicketEvent[], comments: TicketComment[]): TicketActivityEntry[] {
+  const eventEntries = events.map((event) => ({
+    id: `event-${event.id}`,
+    createdAt: event.created_at,
+    ...formatActivityEvent(event),
+  }))
+
+  const commentEntries = comments.map((comment) => ({
+    id: `comment-${comment.id}`,
+    createdAt: comment.created_at,
+    title: `Comment by ${comment.author || 'User'}`,
+    detail: comment.content || 'No comment content.',
+  }))
+
+  return [...eventEntries, ...commentEntries].sort((left, right) => {
+    const leftMs = Date.parse(left.createdAt)
+    const rightMs = Date.parse(right.createdAt)
+
+    if (!Number.isFinite(leftMs) || !Number.isFinite(rightMs)) {
+      return right.createdAt.localeCompare(left.createdAt)
+    }
+
+    return rightMs - leftMs
+  })
 }
 
 function formatHistoryEvent(event: TicketEvent): { title: string; detail: string } {
