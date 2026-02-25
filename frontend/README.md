@@ -16,6 +16,7 @@ npm run dev
 - `VITE_API_BASE_URL` - Base URL for backend API requests.
   - Example: `http://localhost:8080`
   - Loaded from root `.env` (`../.env`) via `vite.config.ts` `envDir: '..'`
+- `FRONTEND_URL` - Frontend URL used for backend CORS and frontend dev host/port.
 
 ## Scripts
 

@@ -12,6 +12,7 @@ import type {
   CreateTicketRequest,
   DeleteWorkspaceFileResponse,
   GatewayHealthResponse,
+  GatewaySessionsActivityResponse,
   HealthResponse,
   MoveTicketRequest,
   MoveTicketResponse,
@@ -202,6 +203,20 @@ export function useGatewayHealthQuery(refreshToken = 0) {
     key: `gateway-health:${refreshToken}`,
     fetcher,
   })
+}
+
+export function useGatewaySessionsActivityQuery(
+  options: { sessionLimit?: number; historyLimit?: number } = {},
+  refreshToken = 0,
+) {
+  const sessionLimit = options.sessionLimit ?? 24
+  const historyLimit = options.historyLimit ?? 160
+  const key = `gateway-sessions-activity:${sessionLimit}:${historyLimit}:${refreshToken}`
+  const fetcher = useCallback(
+    (signal: AbortSignal) => apiClient.getGatewaySessionsActivity({ sessionLimit, historyLimit }, signal),
+    [historyLimit, sessionLimit],
+  )
+  return useApiQuery<GatewaySessionsActivityResponse>({ key, fetcher })
 }
 
 export function useTicketsQuery(filters: TicketFilters = {}, refreshToken = 0) {

@@ -200,3 +200,51 @@ export type ActivityFilters = {
   eventType?: string
   includeArchived?: boolean
 }
+
+export type SessionCommandStatus = 'running' | 'success' | 'error' | 'unknown'
+
+export type GatewaySessionCommandRun = {
+  callId: string
+  toolName: string
+  status: SessionCommandStatus
+  command: string | null
+  preview: string | null
+  startedAt: string | null
+  finishedAt: string | null
+  updatedAt: string | null
+}
+
+export type GatewaySessionTicketRef = {
+  id: number
+  title: string
+  status: TicketStatus
+  assignee: string
+}
+
+export type GatewaySessionActivity = {
+  key: string
+  status: string
+  kind: string | null
+  channel: string | null
+  displayName: string | null
+  model: string | null
+  agentId: string | null
+  agentName: string | null
+  updatedAt: string | null
+  commandCount: number
+  runningCount: number
+  errorCount: number
+  lastCommandAt: string | null
+  lastCommandStatus: SessionCommandStatus | null
+  lastCommandPreview: string | null
+  historyError: string | null
+  tickets: GatewaySessionTicketRef[]
+  commands: GatewaySessionCommandRun[]
+}
+
+export type GatewaySessionsActivityResponse = {
+  ok: boolean
+  generatedAt: string
+  sessions: GatewaySessionActivity[]
+  detail?: string
+}

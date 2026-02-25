@@ -25,6 +25,20 @@
 - Dedicated Activity page (`/log`, labeled “Activity” in UI).
 - Per-ticket events and global activity stream.
 
+### Sessions Monitor
+- Dedicated Sessions page (`/sessions`) for live agent/session observability.
+- Session cards show key, status, agent identity, channel, and last update time.
+- Command timeline per session (up to 8 newest shown) with:
+  - Tool status (`running`/`success`/`error`)
+  - Command payload summary
+  - Result preview excerpt
+- Filters: `All`, `Running`, `Errors`, `Idle`.
+- Supports global search across session metadata, linked tickets, and command snippets.
+- Operator controls for API depth:
+  - Session fetch limit (`session_limit`, 1..200)
+  - History fetch limit (`history_limit`, 1..500)
+- Linked ticket chips are shown when `tickets.agent_session_key` matches the gateway session key.
+
 ### Workspace (File Studio)
 - Workspace tree for browsing files/directories.
 - Open, edit, auto-save UTF-8 text files.
@@ -54,6 +68,7 @@
 - React + TypeScript + Vite: `frontend/`
 - Routing (React Router):
   - `/dashboard`
+  - `/sessions`
   - `/workspace`
   - `/log` (UI label: Activity)
   - `/settings` (placeholder)
@@ -173,6 +188,9 @@ Required for full OpenClaw integration:
 Common variables:
 - `VITE_API_BASE_URL=http://localhost:8080`
 - `PORT=8080` (optional; if omitted, backend derives port from `VITE_API_BASE_URL`)
+- `FRONTEND_URL=http://localhost:5173` (used by backend CORS and frontend dev bind target)
+- `scripts/start-backend.sh` derives backend bind host/port from `VITE_API_BASE_URL` (or falls back to `PORT`, then defaults).
+- `scripts/start-frontend.sh` derives frontend dev host/port from `FRONTEND_URL` (or defaults).
 - `WORKSPACE_BROWSER_ROOT=.../.openclaw/workspace`
 - `WORKSPACE_MAX_FILE_BYTES=2097152` (default 2MB)
 
@@ -219,7 +237,14 @@ Then open:
 - `GET /api/health`
 - `GET /api/config`
 - `GET /api/gateway/health`
+- `GET /api/gateway/sessions/activity?session_limit=24&history_limit=160`
 - `GET /api/agents?force_refresh=false`
+
+`/api/gateway/sessions/activity` response includes:
+- Snapshot metadata: `ok`, `generatedAt`, optional `detail`
+- Per-session aggregates: `commandCount`, `runningCount`, `errorCount`, `lastCommand*`
+- Linked ticket refs: `tickets[]`
+- Parsed command runs: `commands[]` (`callId`, `toolName`, `status`, `command`, `preview`, timestamps)
 
 ### Tickets
 - `GET /api/tickets?status=&assignee=&archived=false`
@@ -268,6 +293,7 @@ Indexes include status, updated time, archived time, and ticket foreign-key look
 ## Frontend Routes and Notes
 
 - `/dashboard`: main board + DnD + ticket drawer
+- `/sessions`: live session monitor with command timeline and health filters
 - `/workspace`: file studio
 - `/log`: activity stream page (shown as “Activity” in nav)
 - `/settings`: placeholder page
@@ -279,6 +305,10 @@ For automation to work, gateway must allow relevant tools:
 - `agents_list`
 - `sessions_spawn`
 - `sessions_send`
+
+For Session Monitor (`/sessions`):
+- Required: `sessions_list`
+- Recommended: `sessions_history` (without it, sessions still render but command history rows show errors)
 
 If `/tools/invoke` rejects tools, update gateway policy accordingly.
 

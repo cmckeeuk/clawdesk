@@ -76,12 +76,18 @@ def infer_port(default: int = 8080) -> int:
 
     return default
 
+
 OPENCLAW_GATEWAY_URL = os.getenv("OPENCLAW_GATEWAY_URL", "").strip().rstrip("/")
 OPENCLAW_TOKEN = os.getenv("OPENCLAW_TOKEN", "").strip()
 PORT = infer_port(8080)
 API_BASE_URL = os.getenv("VITE_API_BASE_URL", "").strip().rstrip("/")
 if not API_BASE_URL:
     API_BASE_URL = f"http://localhost:{PORT}"
+FRONTEND_URL = os.getenv("FRONTEND_URL", "").strip().rstrip("/")
+CORS_ALLOW_ORIGINS = [FRONTEND_URL] if FRONTEND_URL else []
+CORS_ALLOW_METHODS = ["GET", "POST", "PATCH", "PUT", "DELETE"]
+CORS_ALLOW_HEADERS = ["Authorization", "Content-Type"]
+CORS_ALLOW_CREDENTIALS = True
 AGENT_CACHE_TTL_SECONDS = 60 * 60
 DEFAULT_WORKSPACE_ROOT = BASE_DIR.parent.parent
 WORKSPACE_ROOT = Path(os.getenv("WORKSPACE_BROWSER_ROOT", str(DEFAULT_WORKSPACE_ROOT))).expanduser().resolve()
@@ -128,6 +134,8 @@ ALLOWED_TRANSITIONS = {
     "Review": {"Plan", "Todo", "In Progress", "Done"},
     "Done": {"Plan", "Todo", "Review"},
 }
+COMMAND_MONITOR_TOOL_NAMES = {"exec", "process", "bash", "shell"}
+COMMAND_MONITOR_TOOL_BLOCK_TYPES = {"tooluse", "tool_use", "toolcall", "tool_call"}
 
 
 class ConnectionManager:
@@ -546,19 +554,10 @@ class WorkspaceFileCreate(BaseModel):
 app = FastAPI(title="OpenClaw Kanban", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:8080",
-        "http://127.0.0.1:8080",
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:4173",
-        "http://127.0.0.1:4173",
-    ],
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "PATCH", "PUT", "DELETE"],
-    allow_headers=["Authorization", "Content-Type"],
+    allow_origins=CORS_ALLOW_ORIGINS,
+    allow_credentials=CORS_ALLOW_CREDENTIALS,
+    allow_methods=CORS_ALLOW_METHODS,
+    allow_headers=CORS_ALLOW_HEADERS,
 )
 
 if FRONTEND_DIST_DIR.exists():
@@ -805,6 +804,341 @@ def parse_sessions_list_response(response: Dict[str, Any]) -> List[Dict[str, Any
                 return [entry for entry in parsed if isinstance(entry, dict)]
 
     return []
+
+
+def parse_tool_result_details(response: Dict[str, Any]) -> Dict[str, Any]:
+    result = response.get("result", {}) if isinstance(response, dict) else {}
+    if not isinstance(result, dict):
+        return {}
+
+    details = result.get("details")
+    if isinstance(details, dict):
+        return details
+
+    content = result.get("content")
+    if isinstance(content, list):
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            text = item.get("text")
+            if not isinstance(text, str):
+                continue
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+
+    return {}
+
+
+def parse_sessions_history_messages(response: Dict[str, Any]) -> List[Dict[str, Any]]:
+    details = parse_tool_result_details(response)
+    messages = details.get("messages")
+    if isinstance(messages, list):
+        return [message for message in messages if isinstance(message, dict)]
+    return []
+
+
+def normalize_gateway_timestamp(value: Any) -> Dict[str, Any]:
+    if isinstance(value, (int, float)):
+        ts = float(value)
+        if ts <= 0:
+            return {"iso": None, "ms": None}
+        ts_ms = int(ts if ts > 1_000_000_000_000 else ts * 1000)
+        dt = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).isoformat()
+        return {"iso": dt, "ms": ts_ms}
+
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return {"iso": None, "ms": None}
+        parsed_dt: Optional[datetime] = None
+        try:
+            parsed_dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            parsed_dt = None
+        if parsed_dt is None:
+            return {"iso": raw, "ms": None}
+        if parsed_dt.tzinfo is None:
+            parsed_dt = parsed_dt.replace(tzinfo=timezone.utc)
+        parsed_utc = parsed_dt.astimezone(timezone.utc)
+        return {"iso": parsed_utc.isoformat(), "ms": int(parsed_utc.timestamp() * 1000)}
+
+    return {"iso": None, "ms": None}
+
+
+def content_preview(value: Any, max_chars: int = 500) -> Optional[str]:
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        return text[:max_chars]
+
+    if not isinstance(value, list):
+        return None
+
+    parts: List[str] = []
+    for block in value:
+        if not isinstance(block, dict):
+            continue
+        text = block.get("text")
+        if isinstance(text, str) and text.strip():
+            parts.append(text.strip())
+            continue
+        partial = block.get("partialJson")
+        if isinstance(partial, str) and partial.strip():
+            parts.append(partial.strip())
+
+    if not parts:
+        return None
+    return "\n".join(parts)[:max_chars]
+
+
+def command_input_summary(value: Any) -> Optional[str]:
+    if isinstance(value, str):
+        text = value.strip()
+        return text[:500] if text else None
+
+    if not isinstance(value, dict):
+        return None
+
+    command = value.get("command")
+    if isinstance(command, str) and command.strip():
+        return command.strip()[:500]
+
+    action = value.get("action")
+    session_id = value.get("sessionId")
+    if isinstance(action, str) and action.strip():
+        if isinstance(session_id, str) and session_id.strip():
+            return f"action={action.strip()} sessionId={session_id.strip()}"[:500]
+        return f"action={action.strip()}"[:500]
+
+    compact = json.dumps(value, ensure_ascii=True, separators=(",", ":"))
+    return compact[:500] if compact else None
+
+
+def infer_command_result_status(message: Dict[str, Any], preview: Optional[str]) -> str:
+    if bool(message.get("isError")):
+        return "error"
+
+    text = (preview or "").lower()
+    if "command still running" in text:
+        return "running"
+
+    exit_match = re.search(r"exited with code\\s+(-?\\d+)", text)
+    if exit_match:
+        try:
+            code = int(exit_match.group(1))
+        except ValueError:
+            code = 1
+        return "success" if code == 0 else "error"
+
+    if "http error" in text or text.startswith("error:") or "traceback" in text:
+        return "error"
+    if preview:
+        return "success"
+    return "unknown"
+
+
+def infer_agent_id_from_session_key(session_key: str) -> Optional[str]:
+    key = session_key.strip()
+    if key.startswith("agent:"):
+        parts = key.split(":")
+        if len(parts) >= 2 and parts[1]:
+            return parts[1]
+    return None
+
+
+def extract_command_runs(messages: List[Dict[str, Any]], max_runs: int = 120) -> List[Dict[str, Any]]:
+    runs_by_call_id: Dict[str, Dict[str, Any]] = {}
+    creation_order: List[str] = []
+    synthetic_counter = 0
+
+    def ensure_run(call_id: str, tool_name: str, index: int) -> Dict[str, Any]:
+        run = runs_by_call_id.get(call_id)
+        if run is not None:
+            if not run.get("toolName"):
+                run["toolName"] = tool_name
+            return run
+
+        run = {
+            "callId": call_id,
+            "toolName": tool_name,
+            "status": "running",
+            "command": None,
+            "preview": None,
+            "startedAt": None,
+            "finishedAt": None,
+            "updatedAt": None,
+            "startedAtMs": None,
+            "updatedAtMs": None,
+            "index": index,
+        }
+        runs_by_call_id[call_id] = run
+        creation_order.append(call_id)
+        return run
+
+    for index, message in enumerate(messages):
+        role = str(message.get("role") or "")
+        timestamp = normalize_gateway_timestamp(message.get("timestamp"))
+        timestamp_iso = timestamp.get("iso")
+        timestamp_ms = timestamp.get("ms")
+
+        if role in {"assistant", "tool"}:
+            content = message.get("content")
+            if isinstance(content, list):
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    block_type = str(block.get("type") or "").strip().lower()
+                    if block_type not in COMMAND_MONITOR_TOOL_BLOCK_TYPES:
+                        continue
+                    tool_name = str(block.get("name") or block.get("toolName") or "").strip().lower()
+                    if tool_name not in COMMAND_MONITOR_TOOL_NAMES:
+                        continue
+
+                    raw_call_id = block.get("id") or block.get("toolCallId")
+                    call_id = str(raw_call_id).strip() if raw_call_id is not None else ""
+                    if not call_id:
+                        synthetic_counter += 1
+                        call_id = f"req-{index}-{synthetic_counter}"
+
+                    run = ensure_run(call_id, tool_name, index)
+                    command_text = command_input_summary(
+                        block.get("input") or block.get("arguments") or block.get("args")
+                    )
+                    if command_text:
+                        run["command"] = command_text
+                    if timestamp_iso and not run.get("startedAt"):
+                        run["startedAt"] = timestamp_iso
+                    if timestamp_ms is not None and run.get("startedAtMs") is None:
+                        run["startedAtMs"] = timestamp_ms
+                    if timestamp_iso:
+                        run["updatedAt"] = timestamp_iso
+                    if timestamp_ms is not None:
+                        run["updatedAtMs"] = timestamp_ms
+
+        if role != "toolResult":
+            continue
+
+        tool_name = str(message.get("toolName") or message.get("name") or "").strip().lower()
+        if tool_name not in COMMAND_MONITOR_TOOL_NAMES:
+            continue
+
+        raw_call_id = message.get("toolCallId") or message.get("id")
+        call_id = str(raw_call_id).strip() if raw_call_id is not None else ""
+        if not call_id:
+            synthetic_counter += 1
+            call_id = f"result-{index}-{synthetic_counter}"
+
+        run = ensure_run(call_id, tool_name, index)
+        preview = content_preview(message.get("content"))
+        run["preview"] = preview
+        run["status"] = infer_command_result_status(message, preview)
+        if timestamp_iso:
+            run["updatedAt"] = timestamp_iso
+        if timestamp_ms is not None:
+            run["updatedAtMs"] = timestamp_ms
+        if run["status"] != "running":
+            if timestamp_iso:
+                run["finishedAt"] = timestamp_iso
+            if run.get("startedAt") is None and timestamp_iso:
+                run["startedAt"] = timestamp_iso
+            if run.get("startedAtMs") is None and timestamp_ms is not None:
+                run["startedAtMs"] = timestamp_ms
+
+    runs: List[Dict[str, Any]] = []
+    for call_id in creation_order:
+        run = runs_by_call_id.get(call_id)
+        if not run:
+            continue
+        runs.append(
+            {
+                "callId": run.get("callId"),
+                "toolName": run.get("toolName"),
+                "status": run.get("status") or "unknown",
+                "command": run.get("command"),
+                "preview": run.get("preview"),
+                "startedAt": run.get("startedAt"),
+                "finishedAt": run.get("finishedAt"),
+                "updatedAt": run.get("updatedAt"),
+                "_updatedAtMs": run.get("updatedAtMs"),
+                "_startedAtMs": run.get("startedAtMs"),
+                "_index": run.get("index"),
+            }
+        )
+
+    runs.sort(
+        key=lambda run: (
+            int(run.get("_updatedAtMs") or run.get("_startedAtMs") or 0),
+            int(run.get("_index") or 0),
+        ),
+        reverse=True,
+    )
+
+    compacted: List[Dict[str, Any]] = []
+    for run in runs[:max_runs]:
+        item = dict(run)
+        item.pop("_updatedAtMs", None)
+        item.pop("_startedAtMs", None)
+        item.pop("_index", None)
+        compacted.append(item)
+    return compacted
+
+
+async def fetch_gateway_sessions_with_fallback(limit: int) -> List[Dict[str, Any]]:
+    last_error: Optional[HTTPException] = None
+    attempts = [
+        {"limit": limit, "messageLimit": 0},
+        {"limit": limit},
+        {},
+    ]
+    for args in attempts:
+        try:
+            response = await call_openclaw_tool("sessions_list", args, timeout_seconds=20.0)
+            return parse_sessions_list_response(response)
+        except HTTPException as exc:
+            last_error = exc
+            continue
+
+    if last_error is not None:
+        raise last_error
+    return []
+
+
+def tickets_by_session_key(session_keys: List[str]) -> Dict[str, List[Dict[str, Any]]]:
+    keys = [key.strip() for key in session_keys if key and key.strip()]
+    if not keys:
+        return {}
+
+    placeholders = ",".join(["?"] * len(keys))
+    query = (
+        "SELECT id, title, status, assignee, agent_session_key "
+        "FROM tickets "
+        f"WHERE agent_session_key IN ({placeholders})"
+    )
+    mapping: Dict[str, List[Dict[str, Any]]] = {}
+    with get_db() as conn:
+        rows = conn.execute(query, keys).fetchall()
+        for row in rows:
+            key = str(row["agent_session_key"] or "").strip()
+            if not key:
+                continue
+            mapping.setdefault(key, []).append(
+                {
+                    "id": int(row["id"]),
+                    "title": str(row["title"] or ""),
+                    "status": str(row["status"] or ""),
+                    "assignee": str(row["assignee"] or ""),
+                }
+            )
+
+    for key in mapping:
+        mapping[key].sort(key=lambda item: item["id"], reverse=True)
+
+    return mapping
 
 
 async def is_session_live(session_key: str) -> Dict[str, Any]:
@@ -1157,6 +1491,142 @@ async def gateway_health() -> Dict[str, Any]:
                 "gateway": "unreachable",
                 "detail": f"agents_list failed: {agents_exc.detail}; sessions_list failed: {sessions_exc.detail}",
             }
+
+
+@app.get("/api/gateway/sessions/activity")
+async def gateway_sessions_activity(session_limit: int = 24, history_limit: int = 160) -> Dict[str, Any]:
+    if session_limit < 1 or session_limit > 200:
+        raise HTTPException(status_code=400, detail="session_limit must be between 1 and 200")
+    if history_limit < 1 or history_limit > 500:
+        raise HTTPException(status_code=400, detail="history_limit must be between 1 and 500")
+
+    generated_at = now_iso()
+    if not OPENCLAW_TOKEN:
+        return {
+            "ok": False,
+            "generatedAt": generated_at,
+            "sessions": [],
+            "detail": "OPENCLAW_TOKEN is not configured",
+        }
+
+    try:
+        sessions = await fetch_gateway_sessions_with_fallback(limit=session_limit)
+    except HTTPException as exc:
+        return {
+            "ok": False,
+            "generatedAt": generated_at,
+            "sessions": [],
+            "detail": str(exc.detail),
+        }
+
+    agent_name_by_id: Dict[str, str] = {}
+    try:
+        directory = await get_cached_gateway_agents(force_refresh=False)
+        for item in directory.get("agents", []):
+            if not isinstance(item, dict):
+                continue
+            agent_id = str(item.get("id") or "").strip()
+            if not agent_id:
+                continue
+            name = str(item.get("name") or "").strip()
+            if name:
+                agent_name_by_id[agent_id] = name
+    except HTTPException:
+        pass
+
+    session_keys: List[str] = []
+    for session in sessions:
+        key = str(session.get("key") or session.get("sessionKey") or session.get("id") or "").strip()
+        if key:
+            session_keys.append(key)
+    ticket_map = tickets_by_session_key(session_keys)
+
+    semaphore = asyncio.Semaphore(6)
+
+    async def build_session_activity(session: Dict[str, Any], index: int) -> Dict[str, Any]:
+        key = str(session.get("key") or session.get("sessionKey") or session.get("id") or "").strip()
+        status = str(session.get("status") or session.get("state") or "unknown").strip().lower() or "unknown"
+        kind = str(session.get("kind") or "").strip() or None
+        channel = str(session.get("channel") or session.get("lastChannel") or "").strip() or None
+        display_name = str(session.get("displayName") or "").strip() or None
+        model = str(session.get("model") or "").strip() or None
+
+        delivery_context = session.get("deliveryContext")
+        if channel is None and isinstance(delivery_context, dict):
+            delivery_channel = delivery_context.get("channel")
+            if isinstance(delivery_channel, str) and delivery_channel.strip():
+                channel = delivery_channel.strip()
+
+        updated_raw = session.get("updatedAt") or session.get("updated_at") or session.get("timestamp")
+        updated_ts = normalize_gateway_timestamp(updated_raw)
+        updated_at = updated_ts.get("iso")
+        updated_at_ms = int(updated_ts.get("ms") or 0)
+
+        agent_id = str(session.get("agentId") or "").strip() or infer_agent_id_from_session_key(key)
+        agent_name = agent_name_by_id.get(agent_id) if agent_id else None
+
+        commands: List[Dict[str, Any]] = []
+        history_error: Optional[str] = None
+
+        if key:
+            async with semaphore:
+                try:
+                    history_response = await call_openclaw_tool(
+                        "sessions_history",
+                        {"sessionKey": key, "limit": history_limit, "includeTools": True},
+                        timeout_seconds=30.0,
+                    )
+                    messages = parse_sessions_history_messages(history_response)
+                    commands = extract_command_runs(messages)
+                except HTTPException as exc:
+                    history_error = str(exc.detail)
+
+        running_count = sum(1 for item in commands if str(item.get("status")) == "running")
+        error_count = sum(1 for item in commands if str(item.get("status")) == "error")
+        last_command = commands[0] if commands else None
+
+        last_command_at = str(last_command.get("updatedAt")) if isinstance(last_command, dict) else None
+        last_command_status = str(last_command.get("status")) if isinstance(last_command, dict) else None
+        last_command_preview = (
+            str(last_command.get("preview"))[:220]
+            if isinstance(last_command, dict) and isinstance(last_command.get("preview"), str)
+            else None
+        )
+
+        return {
+            "key": key,
+            "status": status,
+            "kind": kind,
+            "channel": channel,
+            "displayName": display_name,
+            "model": model,
+            "agentId": agent_id,
+            "agentName": agent_name,
+            "updatedAt": updated_at,
+            "commandCount": len(commands),
+            "runningCount": running_count,
+            "errorCount": error_count,
+            "lastCommandAt": last_command_at,
+            "lastCommandStatus": last_command_status,
+            "lastCommandPreview": last_command_preview,
+            "historyError": history_error,
+            "tickets": ticket_map.get(key, []),
+            "commands": commands,
+            "_updatedAtMs": updated_at_ms,
+            "_index": index,
+        }
+
+    session_rows = await asyncio.gather(*[build_session_activity(session, idx) for idx, session in enumerate(sessions)])
+    session_rows.sort(key=lambda row: (int(row.get("_updatedAtMs") or 0), -int(row.get("_index") or 0)), reverse=True)
+    for row in session_rows:
+        row.pop("_updatedAtMs", None)
+        row.pop("_index", None)
+
+    return {
+        "ok": True,
+        "generatedAt": generated_at,
+        "sessions": session_rows,
+    }
 
 
 @app.get("/api/activity")

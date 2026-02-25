@@ -39,6 +39,7 @@ import {
   useActivityQuery,
   useArchiveTicketMutation,
   useConfigQuery,
+  useGatewaySessionsActivityQuery,
   useCreateTicketMutation,
   useGatewayHealthQuery,
   useHealthQuery,
@@ -49,6 +50,7 @@ import {
 import type {
   ConfigResponse,
   CreateTicketRequest,
+  GatewaySessionActivity,
   Ticket,
   TicketPriority,
   TicketStatus,
@@ -60,6 +62,7 @@ import clawdeskIcon from './assets/clawdesk.png'
 import filesIcon from './assets/files.png'
 import kanbanIcon from './assets/kanban.png'
 import settingsIcon from './assets/settings.png'
+import usersIcon from './assets/users.png'
 import './App.css'
 
 type NavItem = {
@@ -94,6 +97,7 @@ const NAV_ITEMS: NavItem[] = [
   { label: 'Dashboard', path: '/dashboard', iconSrc: kanbanIcon },
   { label: 'Workspace', path: '/workspace', iconSrc: filesIcon },
   { label: 'Activity', path: '/log', iconSrc: activityIcon },
+  { label: 'Sessions', path: '/sessions', iconSrc: usersIcon },
   { label: 'Settings', path: '/settings', iconSrc: settingsIcon },
   { label: 'Archived', path: '/archived', iconSrc: archiveIcon },
 ]
@@ -110,6 +114,10 @@ const ROUTE_META: Record<string, RouteMeta> = {
   '/log': {
     title: 'Activity',
     subtitle: 'Live cross-ticket activity feed for high-tempo coordination.',
+  },
+  '/sessions': {
+    title: 'Sessions',
+    subtitle: 'Live monitor for agents, session health, and command execution timelines.',
   },
   '/settings': {
     title: 'Settings',
@@ -263,6 +271,10 @@ function App() {
           <Route
             path="/log"
             element={<ActivityPage />}
+          />
+          <Route
+            path="/sessions"
+            element={<SessionsMonitorPage />}
           />
           <Route
             path="/settings"
@@ -1271,6 +1283,216 @@ function ActivityPage() {
   )
 }
 
+function SessionsMonitorPage() {
+  const { searchValue, refreshToken } = useAppShellContext()
+  const [sessionLimit, setSessionLimit] = useState(24)
+  const [historyLimit, setHistoryLimit] = useState(160)
+  const [statusFilter, setStatusFilter] = useState<'all' | 'running' | 'errors' | 'idle'>('all')
+
+  const sessionsQuery = useGatewaySessionsActivityQuery({ sessionLimit, historyLimit }, refreshToken)
+  useTicketRealtimeRefetch(sessionsQuery.refetch)
+
+  const sessions = sessionsQuery.data?.sessions ?? []
+  const filteredSessions = useMemo(() => {
+    const search = searchValue.trim().toLowerCase()
+
+    return sessions.filter((session) => {
+      if (statusFilter === 'running' && session.runningCount <= 0) {
+        return false
+      }
+      if (statusFilter === 'errors' && session.errorCount <= 0 && !session.historyError) {
+        return false
+      }
+      if (statusFilter === 'idle' && (session.commandCount > 0 || session.runningCount > 0)) {
+        return false
+      }
+
+      if (!search) {
+        return true
+      }
+
+      const haystack = [
+        session.key,
+        session.status,
+        session.kind ?? '',
+        session.channel ?? '',
+        session.displayName ?? '',
+        session.agentId ?? '',
+        session.agentName ?? '',
+        session.lastCommandPreview ?? '',
+        ...session.tickets.map((ticket) => `${ticket.id} ${ticket.title} ${ticket.assignee}`),
+        ...session.commands.slice(0, 8).map((command) => `${command.toolName} ${command.command ?? ''} ${command.preview ?? ''}`),
+      ]
+        .join(' ')
+        .toLowerCase()
+
+      return haystack.includes(search)
+    })
+  }, [searchValue, sessions, statusFilter])
+
+  const runningCommands = useMemo(() => sessions.reduce((total, session) => total + session.runningCount, 0), [sessions])
+  const erroredSessions = useMemo(
+    () => sessions.filter((session) => session.errorCount > 0 || Boolean(session.historyError)).length,
+    [sessions],
+  )
+  const activeAgents = useMemo(() => {
+    const values = new Set<string>()
+    for (const session of sessions) {
+      const identity = session.agentName ?? session.agentId
+      if (identity) {
+        values.add(identity)
+      }
+    }
+    return values.size
+  }, [sessions])
+
+  return (
+    <section className="dashboard-content" aria-label="Session and command monitor">
+      <Card className="sessions-monitor-summary">
+        <Tag>Total Sessions {filteredSessions.length}</Tag>
+        <Tag>Active Agents {activeAgents}</Tag>
+        <Tag tone={runningCommands > 0 ? 'warning' : 'default'}>Running Commands {runningCommands}</Tag>
+        <Tag tone={erroredSessions > 0 ? 'danger' : 'default'}>Sessions With Errors {erroredSessions}</Tag>
+      </Card>
+
+      <Card className="sessions-monitor-controls" elevated>
+        <div className="sessions-monitor-filter-row">
+          <button
+            type="button"
+            className={cn('activity-filter-btn', statusFilter === 'all' && 'activity-filter-btn-active')}
+            onClick={() => setStatusFilter('all')}
+          >
+            All
+          </button>
+          <button
+            type="button"
+            className={cn('activity-filter-btn', statusFilter === 'running' && 'activity-filter-btn-active')}
+            onClick={() => setStatusFilter('running')}
+          >
+            Running
+          </button>
+          <button
+            type="button"
+            className={cn('activity-filter-btn', statusFilter === 'errors' && 'activity-filter-btn-active')}
+            onClick={() => setStatusFilter('errors')}
+          >
+            Errors
+          </button>
+          <button
+            type="button"
+            className={cn('activity-filter-btn', statusFilter === 'idle' && 'activity-filter-btn-active')}
+            onClick={() => setStatusFilter('idle')}
+          >
+            Idle
+          </button>
+        </div>
+        <div className="sessions-monitor-input-row">
+          <label className="sessions-monitor-input">
+            <span>Sessions</span>
+            <Input
+              type="number"
+              min={1}
+              max={200}
+              value={String(sessionLimit)}
+              onChange={(event) => {
+                const next = Number.parseInt(event.target.value, 10)
+                if (Number.isFinite(next)) {
+                  setSessionLimit(Math.min(200, Math.max(1, next)))
+                }
+              }}
+            />
+          </label>
+          <label className="sessions-monitor-input">
+            <span>History / session</span>
+            <Input
+              type="number"
+              min={1}
+              max={500}
+              value={String(historyLimit)}
+              onChange={(event) => {
+                const next = Number.parseInt(event.target.value, 10)
+                if (Number.isFinite(next)) {
+                  setHistoryLimit(Math.min(500, Math.max(1, next)))
+                }
+              }}
+            />
+          </label>
+        </div>
+      </Card>
+
+      <Card className="sessions-monitor-board" elevated>
+        {sessionsQuery.uiError ? (
+          <p className="activity-feed-state">
+            <strong>{sessionsQuery.uiError.title}:</strong> {sessionsQuery.uiError.message}
+          </p>
+        ) : null}
+        {sessionsQuery.isLoading ? <p className="activity-feed-state">Loading session monitor...</p> : null}
+        {!sessionsQuery.isLoading && !sessionsQuery.uiError && filteredSessions.length === 0 ? (
+          <p className="activity-feed-state">No sessions match the current filters.</p>
+        ) : null}
+
+        {!sessionsQuery.isLoading && !sessionsQuery.uiError && filteredSessions.length > 0 ? (
+          <ul className="sessions-monitor-list">
+            {filteredSessions.map((session) => (
+              <li key={session.key}>
+                <article className="session-monitor-card">
+                  <header className="session-monitor-card-head">
+                    <div className="session-monitor-card-heading">
+                      <p className="session-monitor-key">{session.key}</p>
+                      <p className="session-monitor-meta">
+                        Agent {session.agentName ?? session.agentId ?? 'unknown'} • Channel {session.channel ?? 'unknown'} • Updated{' '}
+                        {session.updatedAt ? formatUpdatedAtDisplay(session.updatedAt) : 'unknown'}
+                      </p>
+                    </div>
+                    <div className="session-monitor-head-tags">
+                      <Tag tone={sessionTone(session)}>{sessionLabel(session.status)}</Tag>
+                      <Tag tone={session.runningCount > 0 ? 'warning' : 'default'}>Running {session.runningCount}</Tag>
+                      <Tag tone={session.errorCount > 0 ? 'danger' : 'default'}>Errors {session.errorCount}</Tag>
+                    </div>
+                  </header>
+
+                  {session.tickets.length > 0 ? (
+                    <div className="session-monitor-ticket-row">
+                      {session.tickets.map((ticket) => (
+                        <span key={ticket.id} className="session-ticket-chip">
+                          TASK-{ticket.id} {ticket.title}
+                        </span>
+                      ))}
+                    </div>
+                  ) : null}
+
+                  {session.historyError ? (
+                    <p className="session-monitor-error">{session.historyError}</p>
+                  ) : null}
+
+                  {session.commands.length > 0 ? (
+                    <ul className="session-command-list">
+                      {session.commands.slice(0, 8).map((command) => (
+                        <li key={command.callId} className="session-command-row">
+                          <div className="session-command-head">
+                            <Tag tone={commandTone(command.status)}>{command.status}</Tag>
+                            <p className="session-command-time">
+                              {command.updatedAt ? formatUpdatedAtDisplay(command.updatedAt) : 'unknown'}
+                            </p>
+                          </div>
+                          <code className="session-command-code">{command.command ?? '(no command payload)'}</code>
+                          {command.preview ? <p className="session-command-preview">{command.preview}</p> : null}
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p className="panel-inline-muted">No command activity captured for this session.</p>
+                  )}
+                </article>
+              </li>
+            ))}
+          </ul>
+        ) : null}
+      </Card>
+    </section>
+  )
+}
+
 function WorkspaceRoute() {
   const { searchValue, refreshToken, notify } = useAppShellContext()
   return <WorkspacePage searchValue={searchValue} refreshToken={refreshToken} notify={notify} />
@@ -1299,6 +1521,30 @@ function gatewayTone(gateway: 'disabled' | 'reachable' | 'unreachable' | undefin
   }
 
   return 'default' as const
+}
+
+function sessionLabel(value: string): string {
+  return value.replace(/_/g, ' ')
+}
+
+function sessionTone(session: GatewaySessionActivity): 'default' | 'warning' | 'danger' {
+  if (session.errorCount > 0 || Boolean(session.historyError) || session.status.includes('error')) {
+    return 'danger'
+  }
+  if (session.runningCount > 0 || ['running', 'active', 'queued', 'started'].includes(session.status)) {
+    return 'warning'
+  }
+  return 'default'
+}
+
+function commandTone(status: string): 'default' | 'warning' | 'danger' {
+  if (status === 'error') {
+    return 'danger'
+  }
+  if (status === 'running') {
+    return 'warning'
+  }
+  return 'default'
 }
 
 function mergeTickets(

@@ -10,6 +10,7 @@ import type {
   CreateTicketRequest,
   DeleteWorkspaceFileResponse,
   GatewayHealthResponse,
+  GatewaySessionsActivityResponse,
   HealthResponse,
   MoveTicketRequest,
   MoveTicketResponse,
@@ -104,6 +105,19 @@ export const apiClient = {
 
   getGatewayHealth(signal?: AbortSignal) {
     return request<GatewayHealthResponse>('/api/gateway/health', { signal })
+  },
+
+  getGatewaySessionsActivity(
+    params: { sessionLimit?: number; historyLimit?: number } = {},
+    signal?: AbortSignal,
+  ) {
+    return request<GatewaySessionsActivityResponse>('/api/gateway/sessions/activity', {
+      query: {
+        session_limit: params.sessionLimit,
+        history_limit: params.historyLimit,
+      },
+      signal,
+    })
   },
 
   listTickets(filters: TicketFilters = {}, signal?: AbortSignal) {
