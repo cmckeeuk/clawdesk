@@ -237,7 +237,7 @@ Then open:
 - `GET /api/health`
 - `GET /api/config`
 - `GET /api/gateway/health`
-- `GET /api/gateway/sessions/activity?session_limit=24&history_limit=160`
+- `GET /api/gateway/sessions/activity?session_limit=200&history_limit=160`
 - `GET /api/agents?force_refresh=false`
 
 `/api/gateway/sessions/activity` response includes:

@@ -127,6 +127,7 @@ else:
 STATUSES = ["Todo", "Plan", "In Progress", "Review", "Done"]
 PRIORITIES = ["Critical", "High", "Medium", "Low"]
 AUTOMATION_TRIGGER_STATUSES = {"Plan", "In Progress"}
+SESSION_KEY_PATTERN = re.compile(r"(agent:[^`\s,]+)")
 ALLOWED_TRANSITIONS = {
     "Plan": {"Todo", "In Progress", "Review", "Done"},
     "Todo": {"Plan", "In Progress", "Review", "Done"},
@@ -134,7 +135,15 @@ ALLOWED_TRANSITIONS = {
     "Review": {"Plan", "Todo", "In Progress", "Done"},
     "Done": {"Plan", "Todo", "Review"},
 }
-COMMAND_MONITOR_TOOL_NAMES = {"exec", "process", "bash", "shell"}
+COMMAND_MONITOR_TOOL_NAMES = {
+    "exec",
+    "process",
+    "bash",
+    "shell",
+    "exec_command",
+    "run_command",
+    "terminal",
+}
 COMMAND_MONITOR_TOOL_BLOCK_TYPES = {"tooluse", "tool_use", "toolcall", "tool_call"}
 
 
@@ -564,7 +573,12 @@ if FRONTEND_DIST_DIR.exists():
     app.mount("/static", StaticFiles(directory=FRONTEND_DIST_DIR), name="static")
 
 
-async def call_openclaw_tool(tool: str, args: Dict[str, Any], timeout_seconds: float = 60.0) -> Dict[str, Any]:
+async def call_openclaw_tool(
+    tool: str,
+    args: Dict[str, Any],
+    timeout_seconds: float = 60.0,
+    invoke_session_key: Optional[str] = None,
+) -> Dict[str, Any]:
     if not OPENCLAW_TOKEN:
         raise HTTPException(status_code=400, detail="OPENCLAW_TOKEN is not configured")
 
@@ -572,7 +586,9 @@ async def call_openclaw_tool(tool: str, args: Dict[str, Any], timeout_seconds: f
         "Authorization": f"Bearer {OPENCLAW_TOKEN}",
         "Content-Type": "application/json",
     }
-    payload = {"tool": tool, "args": args}
+    payload: Dict[str, Any] = {"tool": tool, "args": args}
+    if isinstance(invoke_session_key, str) and invoke_session_key.strip():
+        payload["sessionKey"] = invoke_session_key.strip()
 
     try:
         async with httpx.AsyncClient(timeout=timeout_seconds) as client:
@@ -833,12 +849,20 @@ def parse_tool_result_details(response: Dict[str, Any]) -> Dict[str, Any]:
     return {}
 
 
-def parse_sessions_history_messages(response: Dict[str, Any]) -> List[Dict[str, Any]]:
+def parse_sessions_history_result(response: Dict[str, Any]) -> Dict[str, Any]:
     details = parse_tool_result_details(response)
     messages = details.get("messages")
-    if isinstance(messages, list):
-        return [message for message in messages if isinstance(message, dict)]
-    return []
+    parsed_messages = [message for message in messages if isinstance(message, dict)] if isinstance(messages, list) else []
+
+    raw_status = details.get("status")
+    status = raw_status.strip().lower() if isinstance(raw_status, str) and raw_status.strip() else None
+
+    raw_error = details.get("error")
+    error = raw_error.strip() if isinstance(raw_error, str) and raw_error.strip() else None
+    if error is None and status and status not in {"ok", "success"}:
+        error = status
+
+    return {"messages": parsed_messages, "status": status, "error": error}
 
 
 def normalize_gateway_timestamp(value: Any) -> Dict[str, Any]:
@@ -951,6 +975,20 @@ def infer_agent_id_from_session_key(session_key: str) -> Optional[str]:
     return None
 
 
+def is_monitored_command_tool(name: Any) -> bool:
+    if not isinstance(name, str):
+        return False
+
+    normalized = name.strip().lower()
+    if not normalized:
+        return False
+    if normalized in COMMAND_MONITOR_TOOL_NAMES:
+        return True
+
+    tail = normalized.rsplit(".", 1)[-1]
+    return tail in COMMAND_MONITOR_TOOL_NAMES
+
+
 def extract_command_runs(messages: List[Dict[str, Any]], max_runs: int = 120) -> List[Dict[str, Any]]:
     runs_by_call_id: Dict[str, Dict[str, Any]] = {}
     creation_order: List[str] = []
@@ -996,7 +1034,7 @@ def extract_command_runs(messages: List[Dict[str, Any]], max_runs: int = 120) ->
                     if block_type not in COMMAND_MONITOR_TOOL_BLOCK_TYPES:
                         continue
                     tool_name = str(block.get("name") or block.get("toolName") or "").strip().lower()
-                    if tool_name not in COMMAND_MONITOR_TOOL_NAMES:
+                    if not is_monitored_command_tool(tool_name):
                         continue
 
                     raw_call_id = block.get("id") or block.get("toolCallId")
@@ -1024,7 +1062,7 @@ def extract_command_runs(messages: List[Dict[str, Any]], max_runs: int = 120) ->
             continue
 
         tool_name = str(message.get("toolName") or message.get("name") or "").strip().lower()
-        if tool_name not in COMMAND_MONITOR_TOOL_NAMES:
+        if not is_monitored_command_tool(tool_name):
             continue
 
         raw_call_id = message.get("toolCallId") or message.get("id")
@@ -1139,6 +1177,94 @@ def tickets_by_session_key(session_keys: List[str]) -> Dict[str, List[Dict[str, 
         mapping[key].sort(key=lambda item: item["id"], reverse=True)
 
     return mapping
+
+
+def extract_session_keys_from_text(value: Any) -> List[str]:
+    if not isinstance(value, str):
+        return []
+
+    keys: List[str] = []
+    seen: Set[str] = set()
+    for match in SESSION_KEY_PATTERN.finditer(value):
+        key = str(match.group(1) or "").strip().rstrip("`.,;:)]}")
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        keys.append(key)
+    return keys
+
+
+def infer_session_status_from_event(event_type: str) -> str:
+    value = event_type.strip().lower()
+    if value == "agent_session_deactivated":
+        return "closed"
+    if value in {"agent_spawned", "agent_reused", "agent_respawned_after_notify_failure"}:
+        return "started"
+    return "unknown"
+
+
+def recent_session_stubs_from_events(limit: int = 800) -> List[Dict[str, Any]]:
+    if limit < 1:
+        return []
+
+    event_types = [
+        "agent_spawned",
+        "agent_reused",
+        "agent_respawned_after_notify_failure",
+        "agent_session_deactivated",
+    ]
+    placeholders = ",".join(["?"] * len(event_types))
+    query = (
+        "SELECT "
+        "e.event_type, e.details, e.created_at, e.ticket_id, "
+        "t.title AS ticket_title, t.status AS ticket_status, t.assignee AS ticket_assignee "
+        "FROM ticket_events e "
+        "JOIN tickets t ON t.id = e.ticket_id "
+        f"WHERE e.event_type IN ({placeholders}) "
+        "ORDER BY e.created_at DESC "
+        "LIMIT ?"
+    )
+
+    sessions_by_key: Dict[str, Dict[str, Any]] = {}
+    with get_db() as conn:
+        rows = conn.execute(query, [*event_types, limit]).fetchall()
+        for row in rows:
+            details = str(row["details"] or "")
+            created_at = str(row["created_at"] or "")
+            status = infer_session_status_from_event(str(row["event_type"] or ""))
+
+            ticket_ref = {
+                "id": int(row["ticket_id"]),
+                "title": str(row["ticket_title"] or ""),
+                "status": str(row["ticket_status"] or ""),
+                "assignee": str(row["ticket_assignee"] or ""),
+            }
+
+            for key in extract_session_keys_from_text(details):
+                existing = sessions_by_key.get(key)
+                if existing is None:
+                    sessions_by_key[key] = {
+                        "key": key,
+                        "status": status,
+                        "kind": "historical",
+                        "channel": None,
+                        "displayName": f"ticket-{ticket_ref['id']}",
+                        "model": None,
+                        "agentId": infer_agent_id_from_session_key(key),
+                        "updatedAt": created_at or None,
+                        "tickets": [ticket_ref],
+                    }
+                    continue
+
+                existing_tickets = existing.get("tickets")
+                if not isinstance(existing_tickets, list):
+                    existing["tickets"] = [ticket_ref]
+                    continue
+                if any(isinstance(item, dict) and int(item.get("id") or 0) == ticket_ref["id"] for item in existing_tickets):
+                    continue
+                existing_tickets.append(ticket_ref)
+
+    return list(sessions_by_key.values())
 
 
 async def is_session_live(session_key: str) -> Dict[str, Any]:
@@ -1494,45 +1620,49 @@ async def gateway_health() -> Dict[str, Any]:
 
 
 @app.get("/api/gateway/sessions/activity")
-async def gateway_sessions_activity(session_limit: int = 24, history_limit: int = 160) -> Dict[str, Any]:
+async def gateway_sessions_activity(session_limit: int = 200, history_limit: int = 160) -> Dict[str, Any]:
     if session_limit < 1 or session_limit > 200:
         raise HTTPException(status_code=400, detail="session_limit must be between 1 and 200")
     if history_limit < 1 or history_limit > 500:
         raise HTTPException(status_code=400, detail="history_limit must be between 1 and 500")
 
     generated_at = now_iso()
+    gateway_error: Optional[str] = None
+    sessions: List[Dict[str, Any]] = []
     if not OPENCLAW_TOKEN:
-        return {
-            "ok": False,
-            "generatedAt": generated_at,
-            "sessions": [],
-            "detail": "OPENCLAW_TOKEN is not configured",
-        }
+        gateway_error = "OPENCLAW_TOKEN is not configured"
+    else:
+        try:
+            sessions = await fetch_gateway_sessions_with_fallback(limit=session_limit)
+        except HTTPException as exc:
+            gateway_error = str(exc.detail)
 
-    try:
-        sessions = await fetch_gateway_sessions_with_fallback(limit=session_limit)
-    except HTTPException as exc:
-        return {
-            "ok": False,
-            "generatedAt": generated_at,
-            "sessions": [],
-            "detail": str(exc.detail),
-        }
+    recent_stubs = recent_session_stubs_from_events(limit=max(session_limit * 6, 400))
+    merged_sessions: List[Dict[str, Any]] = []
+    seen_session_keys: Set[str] = set()
+    for session in [*sessions, *recent_stubs]:
+        key = str(session.get("key") or session.get("sessionKey") or session.get("id") or "").strip()
+        if not key or key in seen_session_keys:
+            continue
+        seen_session_keys.add(key)
+        merged_sessions.append(session)
+    sessions = merged_sessions
 
     agent_name_by_id: Dict[str, str] = {}
-    try:
-        directory = await get_cached_gateway_agents(force_refresh=False)
-        for item in directory.get("agents", []):
-            if not isinstance(item, dict):
-                continue
-            agent_id = str(item.get("id") or "").strip()
-            if not agent_id:
-                continue
-            name = str(item.get("name") or "").strip()
-            if name:
-                agent_name_by_id[agent_id] = name
-    except HTTPException:
-        pass
+    if OPENCLAW_TOKEN:
+        try:
+            directory = await get_cached_gateway_agents(force_refresh=False)
+            for item in directory.get("agents", []):
+                if not isinstance(item, dict):
+                    continue
+                agent_id = str(item.get("id") or "").strip()
+                if not agent_id:
+                    continue
+                name = str(item.get("name") or "").strip()
+                if name:
+                    agent_name_by_id[agent_id] = name
+        except HTTPException:
+            pass
 
     session_keys: List[str] = []
     for session in sessions:
@@ -1540,8 +1670,59 @@ async def gateway_sessions_activity(session_limit: int = 24, history_limit: int 
         if key:
             session_keys.append(key)
     ticket_map = tickets_by_session_key(session_keys)
+    for session in sessions:
+        key = str(session.get("key") or session.get("sessionKey") or session.get("id") or "").strip()
+        if not key or key in ticket_map:
+            continue
+
+        refs = session.get("tickets")
+        if not isinstance(refs, list):
+            continue
+
+        normalized_refs: List[Dict[str, Any]] = []
+        for ref in refs:
+            if not isinstance(ref, dict):
+                continue
+            ref_id = int(ref.get("id") or 0)
+            if ref_id <= 0:
+                continue
+            normalized_refs.append(
+                {
+                    "id": ref_id,
+                    "title": str(ref.get("title") or ""),
+                    "status": str(ref.get("status") or ""),
+                    "assignee": str(ref.get("assignee") or ""),
+                }
+            )
+        if normalized_refs:
+            ticket_map[key] = normalized_refs
 
     semaphore = asyncio.Semaphore(6)
+
+    def sessions_history_contexts(session_key: str, agent_id: Optional[str]) -> List[Optional[str]]:
+        contexts: List[Optional[str]] = [None]
+
+        if agent_id:
+            contexts.append(f"agent:{agent_id}:main")
+        contexts.append(session_key)
+
+        ordered: List[Optional[str]] = []
+        seen: Set[str] = set()
+        for context in contexts:
+            if context is None:
+                if "__default__" in seen:
+                    continue
+                seen.add("__default__")
+                ordered.append(None)
+                continue
+
+            normalized = context.strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            ordered.append(normalized)
+
+        return ordered
 
     async def build_session_activity(session: Dict[str, Any], index: int) -> Dict[str, Any]:
         key = str(session.get("key") or session.get("sessionKey") or session.get("id") or "").strip()
@@ -1569,17 +1750,46 @@ async def gateway_sessions_activity(session_limit: int = 24, history_limit: int 
         history_error: Optional[str] = None
 
         if key:
+            history_messages: List[Dict[str, Any]] = []
+            history_errors: List[str] = []
+            history_contexts = sessions_history_contexts(key, agent_id)
             async with semaphore:
-                try:
-                    history_response = await call_openclaw_tool(
-                        "sessions_history",
-                        {"sessionKey": key, "limit": history_limit, "includeTools": True},
-                        timeout_seconds=30.0,
-                    )
-                    messages = parse_sessions_history_messages(history_response)
-                    commands = extract_command_runs(messages)
-                except HTTPException as exc:
-                    history_error = str(exc.detail)
+                for context_key in history_contexts:
+                    try:
+                        history_response = await call_openclaw_tool(
+                            "sessions_history",
+                            {"sessionKey": key, "limit": history_limit, "includeTools": True},
+                            timeout_seconds=30.0,
+                            invoke_session_key=context_key,
+                        )
+                    except HTTPException as exc:
+                        history_errors.append(str(exc.detail))
+                        continue
+
+                    history_result = parse_sessions_history_result(history_response)
+                    candidate_messages = history_result.get("messages")
+                    if isinstance(candidate_messages, list) and candidate_messages:
+                        history_messages = candidate_messages
+                        break
+
+                    error_message = history_result.get("error")
+                    if isinstance(error_message, str) and error_message.strip():
+                        history_errors.append(error_message.strip())
+
+            commands = extract_command_runs(history_messages)
+            if not commands and history_errors:
+                unique_errors: List[str] = []
+                seen_errors: Set[str] = set()
+                for error_value in history_errors:
+                    normalized = error_value.strip()
+                    if not normalized or normalized in seen_errors:
+                        continue
+                    seen_errors.add(normalized)
+                    unique_errors.append(normalized)
+                    if len(unique_errors) >= 3:
+                        break
+                if unique_errors:
+                    history_error = "; ".join(unique_errors)[:500]
 
         running_count = sum(1 for item in commands if str(item.get("status")) == "running")
         error_count = sum(1 for item in commands if str(item.get("status")) == "error")
@@ -1618,15 +1828,19 @@ async def gateway_sessions_activity(session_limit: int = 24, history_limit: int 
 
     session_rows = await asyncio.gather(*[build_session_activity(session, idx) for idx, session in enumerate(sessions)])
     session_rows.sort(key=lambda row: (int(row.get("_updatedAtMs") or 0), -int(row.get("_index") or 0)), reverse=True)
+    session_rows = session_rows[:session_limit]
     for row in session_rows:
         row.pop("_updatedAtMs", None)
         row.pop("_index", None)
 
-    return {
-        "ok": True,
+    response: Dict[str, Any] = {
+        "ok": gateway_error is None,
         "generatedAt": generated_at,
         "sessions": session_rows,
     }
+    if gateway_error:
+        response["detail"] = gateway_error
+    return response
 
 
 @app.get("/api/activity")

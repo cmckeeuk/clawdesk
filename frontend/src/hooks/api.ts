@@ -209,7 +209,7 @@ export function useGatewaySessionsActivityQuery(
   options: { sessionLimit?: number; historyLimit?: number } = {},
   refreshToken = 0,
 ) {
-  const sessionLimit = options.sessionLimit ?? 24
+  const sessionLimit = options.sessionLimit ?? 200
   const historyLimit = options.historyLimit ?? 160
   const key = `gateway-sessions-activity:${sessionLimit}:${historyLimit}:${refreshToken}`
   const fetcher = useCallback(

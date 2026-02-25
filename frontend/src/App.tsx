@@ -93,6 +93,17 @@ type ShellNotice = {
   message: string
 }
 
+type AgentSessionGroup = {
+  key: string
+  label: string
+  sessions: GatewaySessionActivity[]
+  totalSessions: number
+  runningCount: number
+  errorCount: number
+  updatedAtMs: number
+  updatedAt: string | null
+}
+
 const NAV_ITEMS: NavItem[] = [
   { label: 'Dashboard', path: '/dashboard', iconSrc: kanbanIcon },
   { label: 'Workspace', path: '/workspace', iconSrc: filesIcon },
@@ -1285,25 +1296,46 @@ function ActivityPage() {
 
 function SessionsMonitorPage() {
   const { searchValue, refreshToken } = useAppShellContext()
-  const [sessionLimit, setSessionLimit] = useState(24)
+  const [sessionLimit, setSessionLimit] = useState(200)
   const [historyLimit, setHistoryLimit] = useState(160)
   const [statusFilter, setStatusFilter] = useState<'all' | 'running' | 'errors' | 'idle'>('all')
+  const [agentFocus, setAgentFocus] = useState<'all' | 'running' | 'errors' | 'idle'>('all')
+  const [agentSearchValue, setAgentSearchValue] = useState('')
+  const [selectedAgentKeys, setSelectedAgentKeys] = useState<string[]>([])
+  const [expandedAgentOverrides, setExpandedAgentOverrides] = useState<Record<string, boolean>>({})
+  const [selectedSessionKey, setSelectedSessionKey] = useState<string | null>(null)
 
   const sessionsQuery = useGatewaySessionsActivityQuery({ sessionLimit, historyLimit }, refreshToken)
   useTicketRealtimeRefetch(sessionsQuery.refetch)
 
-  const sessions = sessionsQuery.data?.sessions ?? []
+  const sessions = useMemo(() => sessionsQuery.data?.sessions ?? [], [sessionsQuery.data?.sessions])
   const filteredSessions = useMemo(() => {
     const search = searchValue.trim().toLowerCase()
 
     return sessions.filter((session) => {
-      if (statusFilter === 'running' && session.runningCount <= 0) {
+      if (!sessionMatchesStatusFilter(session, statusFilter)) {
         return false
       }
-      if (statusFilter === 'errors' && session.errorCount <= 0 && !session.historyError) {
+      if (!search) {
+        return true
+      }
+
+      return sessionSearchHaystack(session).includes(search)
+    })
+  }, [searchValue, sessions, statusFilter])
+
+  const allAgentGroups = useMemo(() => buildAgentSessionGroups(sessions), [sessions])
+  const agentRailGroups = useMemo(() => {
+    const search = agentSearchValue.trim().toLowerCase()
+
+    return allAgentGroups.filter((group) => {
+      if (agentFocus === 'running' && group.runningCount <= 0) {
         return false
       }
-      if (statusFilter === 'idle' && (session.commandCount > 0 || session.runningCount > 0)) {
+      if (agentFocus === 'errors' && group.errorCount <= 0) {
+        return false
+      }
+      if (agentFocus === 'idle' && (group.runningCount > 0 || group.errorCount > 0)) {
         return false
       }
 
@@ -1311,183 +1343,525 @@ function SessionsMonitorPage() {
         return true
       }
 
-      const haystack = [
-        session.key,
-        session.status,
-        session.kind ?? '',
-        session.channel ?? '',
-        session.displayName ?? '',
-        session.agentId ?? '',
-        session.agentName ?? '',
-        session.lastCommandPreview ?? '',
-        ...session.tickets.map((ticket) => `${ticket.id} ${ticket.title} ${ticket.assignee}`),
-        ...session.commands.slice(0, 8).map((command) => `${command.toolName} ${command.command ?? ''} ${command.preview ?? ''}`),
-      ]
-        .join(' ')
-        .toLowerCase()
-
-      return haystack.includes(search)
+      return group.label.toLowerCase().includes(search) || group.key.toLowerCase().includes(search)
     })
-  }, [searchValue, sessions, statusFilter])
+  }, [agentFocus, agentSearchValue, allAgentGroups])
 
-  const runningCommands = useMemo(() => sessions.reduce((total, session) => total + session.runningCount, 0), [sessions])
-  const erroredSessions = useMemo(
-    () => sessions.filter((session) => session.errorCount > 0 || Boolean(session.historyError)).length,
-    [sessions],
+  const availableAgentKeys = useMemo(() => new Set(allAgentGroups.map((group) => group.key)), [allAgentGroups])
+  const effectiveSelectedAgentKeys = useMemo(
+    () => selectedAgentKeys.filter((key) => availableAgentKeys.has(key)),
+    [availableAgentKeys, selectedAgentKeys],
   )
-  const activeAgents = useMemo(() => {
-    const values = new Set<string>()
-    for (const session of sessions) {
-      const identity = session.agentName ?? session.agentId
-      if (identity) {
-        values.add(identity)
+
+  const selectedAgentSet = useMemo(() => {
+    if (effectiveSelectedAgentKeys.length === 0) {
+      return null
+    }
+    return new Set(effectiveSelectedAgentKeys)
+  }, [effectiveSelectedAgentKeys])
+
+  const groupedSessions = useMemo(() => {
+    const map = new Map<string, AgentSessionGroup>()
+
+    for (const session of filteredSessions) {
+      const groupKey = agentKeyForSession(session)
+      if (selectedAgentSet && !selectedAgentSet.has(groupKey)) {
+        continue
+      }
+
+      const existing = map.get(groupKey)
+      if (!existing) {
+        map.set(groupKey, {
+          key: groupKey,
+          label: agentLabelForSession(session),
+          sessions: [session],
+          totalSessions: 1,
+          runningCount: session.runningCount,
+          errorCount: session.errorCount > 0 || Boolean(session.historyError) ? 1 : 0,
+          updatedAtMs: sessionUpdatedAtMs(session),
+          updatedAt: session.updatedAt,
+        })
+        continue
+      }
+
+      existing.sessions.push(session)
+      existing.totalSessions += 1
+      existing.runningCount += session.runningCount
+      if (session.errorCount > 0 || Boolean(session.historyError)) {
+        existing.errorCount += 1
+      }
+
+      const updatedAtMs = sessionUpdatedAtMs(session)
+      if (updatedAtMs > existing.updatedAtMs) {
+        existing.updatedAtMs = updatedAtMs
+        existing.updatedAt = session.updatedAt
       }
     }
-    return values.size
-  }, [sessions])
+
+    const groups = Array.from(map.values())
+    for (const group of groups) {
+      group.sessions.sort((left, right) => {
+        const rankDiff = sessionRank(left) - sessionRank(right)
+        if (rankDiff !== 0) {
+          return rankDiff
+        }
+        return sessionUpdatedAtMs(right) - sessionUpdatedAtMs(left)
+      })
+    }
+
+    groups.sort((left, right) => {
+      const leftRank = groupRank(left)
+      const rightRank = groupRank(right)
+      if (leftRank !== rightRank) {
+        return leftRank - rightRank
+      }
+      return right.updatedAtMs - left.updatedAtMs
+    })
+
+    return groups
+  }, [filteredSessions, selectedAgentSet])
+
+  const visibleSessions = useMemo(() => groupedSessions.flatMap((group) => group.sessions), [groupedSessions])
+  const effectiveSelectedSessionKey = useMemo(() => {
+    if (visibleSessions.length === 0) {
+      return null
+    }
+    if (selectedSessionKey && visibleSessions.some((session) => session.key === selectedSessionKey)) {
+      return selectedSessionKey
+    }
+    return visibleSessions[0].key
+  }, [selectedSessionKey, visibleSessions])
+
+  const selectedSession = useMemo(() => {
+    if (!effectiveSelectedSessionKey) {
+      return null
+    }
+    return visibleSessions.find((session) => session.key === effectiveSelectedSessionKey) ?? null
+  }, [effectiveSelectedSessionKey, visibleSessions])
+
+  const activeAgents = allAgentGroups.length
+  const runningCommands = useMemo(
+    () => visibleSessions.reduce((total, session) => total + session.runningCount, 0),
+    [visibleSessions],
+  )
+  const erroredSessions = useMemo(
+    () => visibleSessions.filter((session) => session.errorCount > 0 || Boolean(session.historyError)).length,
+    [visibleSessions],
+  )
+  const isAgentExpanded = (group: AgentSessionGroup) => {
+    if (Object.prototype.hasOwnProperty.call(expandedAgentOverrides, group.key)) {
+      return expandedAgentOverrides[group.key]
+    }
+    return group.runningCount > 0 || group.errorCount > 0
+  }
+  const expandedSessionCount = groupedSessions.reduce(
+    (total, group) => total + (isAgentExpanded(group) ? group.sessions.length : 0),
+    0,
+  )
+
+  const toggleAgentSelection = (agentKey: string) => {
+    setSelectedAgentKeys((previous) => {
+      if (previous.includes(agentKey)) {
+        return previous.filter((value) => value !== agentKey)
+      }
+      return [...previous, agentKey]
+    })
+  }
+
+  const selectedAgentLabelByKey = useMemo(() => {
+    const mapping = new Map<string, string>()
+    for (const group of allAgentGroups) {
+      mapping.set(group.key, group.label)
+    }
+    return mapping
+  }, [allAgentGroups])
+
+  const expandAllAgents = () => {
+    setExpandedAgentOverrides((previous) => {
+      const next = { ...previous }
+      for (const group of groupedSessions) {
+        next[group.key] = true
+      }
+      return next
+    })
+  }
+
+  const collapseAllAgents = () => {
+    setExpandedAgentOverrides((previous) => {
+      const next = { ...previous }
+      for (const group of groupedSessions) {
+        next[group.key] = false
+      }
+      return next
+    })
+  }
+
+  const expandCriticalAgents = () => {
+    setExpandedAgentOverrides((previous) => {
+      const next = { ...previous }
+      for (const group of groupedSessions) {
+        next[group.key] = group.runningCount > 0 || group.errorCount > 0
+      }
+      return next
+    })
+  }
 
   return (
     <section className="dashboard-content" aria-label="Session and command monitor">
       <Card className="sessions-monitor-summary">
-        <Tag>Total Sessions {filteredSessions.length}</Tag>
+        <Tag>Total Sessions {visibleSessions.length}</Tag>
         <Tag>Active Agents {activeAgents}</Tag>
         <Tag tone={runningCommands > 0 ? 'warning' : 'default'}>Running Commands {runningCommands}</Tag>
         <Tag tone={erroredSessions > 0 ? 'danger' : 'default'}>Sessions With Errors {erroredSessions}</Tag>
+        <Tag>Expanded Rows {expandedSessionCount}</Tag>
       </Card>
 
-      <Card className="sessions-monitor-controls" elevated>
-        <div className="sessions-monitor-filter-row">
-          <button
-            type="button"
-            className={cn('activity-filter-btn', statusFilter === 'all' && 'activity-filter-btn-active')}
-            onClick={() => setStatusFilter('all')}
-          >
-            All
-          </button>
-          <button
-            type="button"
-            className={cn('activity-filter-btn', statusFilter === 'running' && 'activity-filter-btn-active')}
-            onClick={() => setStatusFilter('running')}
-          >
-            Running
-          </button>
-          <button
-            type="button"
-            className={cn('activity-filter-btn', statusFilter === 'errors' && 'activity-filter-btn-active')}
-            onClick={() => setStatusFilter('errors')}
-          >
-            Errors
-          </button>
-          <button
-            type="button"
-            className={cn('activity-filter-btn', statusFilter === 'idle' && 'activity-filter-btn-active')}
-            onClick={() => setStatusFilter('idle')}
-          >
-            Idle
-          </button>
-        </div>
-        <div className="sessions-monitor-input-row">
-          <label className="sessions-monitor-input">
-            <span>Sessions</span>
+      <Card className="sessions-monitor-shell" elevated>
+        <aside className="sessions-agent-rail" aria-label="Agent filters">
+          <header className="sessions-pane-head">
+            <div>
+              <h3>Agents</h3>
+              <p>Select one or more agents to narrow session groups.</p>
+            </div>
+            {effectiveSelectedAgentKeys.length > 0 ? (
+              <Button variant="ghost" onClick={() => setSelectedAgentKeys([])}>
+                Clear
+              </Button>
+            ) : null}
+          </header>
+
+          <label className="sessions-agent-search">
+            <span>Find Agent</span>
             <Input
-              type="number"
-              min={1}
-              max={200}
-              value={String(sessionLimit)}
-              onChange={(event) => {
-                const next = Number.parseInt(event.target.value, 10)
-                if (Number.isFinite(next)) {
-                  setSessionLimit(Math.min(200, Math.max(1, next)))
-                }
-              }}
+              value={agentSearchValue}
+              onChange={(event) => setAgentSearchValue(event.target.value)}
+              placeholder="Filter by agent name"
             />
           </label>
-          <label className="sessions-monitor-input">
-            <span>History / session</span>
-            <Input
-              type="number"
-              min={1}
-              max={500}
-              value={String(historyLimit)}
-              onChange={(event) => {
-                const next = Number.parseInt(event.target.value, 10)
-                if (Number.isFinite(next)) {
-                  setHistoryLimit(Math.min(500, Math.max(1, next)))
-                }
-              }}
-            />
-          </label>
-        </div>
-      </Card>
 
-      <Card className="sessions-monitor-board" elevated>
-        {sessionsQuery.uiError ? (
-          <p className="activity-feed-state">
-            <strong>{sessionsQuery.uiError.title}:</strong> {sessionsQuery.uiError.message}
-          </p>
-        ) : null}
-        {sessionsQuery.isLoading ? <p className="activity-feed-state">Loading session monitor...</p> : null}
-        {!sessionsQuery.isLoading && !sessionsQuery.uiError && filteredSessions.length === 0 ? (
-          <p className="activity-feed-state">No sessions match the current filters.</p>
-        ) : null}
+          <div className="sessions-monitor-filter-row">
+            <button
+              type="button"
+              className={cn('activity-filter-btn', agentFocus === 'all' && 'activity-filter-btn-active')}
+              onClick={() => setAgentFocus('all')}
+            >
+              All
+            </button>
+            <button
+              type="button"
+              className={cn('activity-filter-btn', agentFocus === 'running' && 'activity-filter-btn-active')}
+              onClick={() => setAgentFocus('running')}
+            >
+              Running
+            </button>
+            <button
+              type="button"
+              className={cn('activity-filter-btn', agentFocus === 'errors' && 'activity-filter-btn-active')}
+              onClick={() => setAgentFocus('errors')}
+            >
+              Errors
+            </button>
+            <button
+              type="button"
+              className={cn('activity-filter-btn', agentFocus === 'idle' && 'activity-filter-btn-active')}
+              onClick={() => setAgentFocus('idle')}
+            >
+              Idle
+            </button>
+          </div>
 
-        {!sessionsQuery.isLoading && !sessionsQuery.uiError && filteredSessions.length > 0 ? (
-          <ul className="sessions-monitor-list">
-            {filteredSessions.map((session) => (
-              <li key={session.key}>
-                <article className="session-monitor-card">
-                  <header className="session-monitor-card-head">
-                    <div className="session-monitor-card-heading">
-                      <p className="session-monitor-key">{session.key}</p>
-                      <p className="session-monitor-meta">
-                        Agent {session.agentName ?? session.agentId ?? 'unknown'} • Channel {session.channel ?? 'unknown'} • Updated{' '}
-                        {session.updatedAt ? formatUpdatedAtDisplay(session.updatedAt) : 'unknown'}
-                      </p>
+          <ul className="sessions-agent-list">
+            {agentRailGroups.map((group) => {
+              const selected = effectiveSelectedAgentKeys.includes(group.key)
+              return (
+                <li key={group.key}>
+                  <button
+                    type="button"
+                    className={cn('sessions-agent-item', selected && 'sessions-agent-item-active')}
+                    onClick={() => toggleAgentSelection(group.key)}
+                  >
+                    <div className="sessions-agent-item-head">
+                      <p>{group.label}</p>
+                      <Tag>{group.totalSessions}</Tag>
                     </div>
-                    <div className="session-monitor-head-tags">
-                      <Tag tone={sessionTone(session)}>{sessionLabel(session.status)}</Tag>
-                      <Tag tone={session.runningCount > 0 ? 'warning' : 'default'}>Running {session.runningCount}</Tag>
-                      <Tag tone={session.errorCount > 0 ? 'danger' : 'default'}>Errors {session.errorCount}</Tag>
-                    </div>
-                  </header>
-
-                  {session.tickets.length > 0 ? (
-                    <div className="session-monitor-ticket-row">
-                      {session.tickets.map((ticket) => (
-                        <span key={ticket.id} className="session-ticket-chip">
-                          TASK-{ticket.id} {ticket.title}
-                        </span>
-                      ))}
-                    </div>
-                  ) : null}
-
-                  {session.historyError ? (
-                    <p className="session-monitor-error">{session.historyError}</p>
-                  ) : null}
-
-                  {session.commands.length > 0 ? (
-                    <ul className="session-command-list">
-                      {session.commands.slice(0, 8).map((command) => (
-                        <li key={command.callId} className="session-command-row">
-                          <div className="session-command-head">
-                            <Tag tone={commandTone(command.status)}>{command.status}</Tag>
-                            <p className="session-command-time">
-                              {command.updatedAt ? formatUpdatedAtDisplay(command.updatedAt) : 'unknown'}
-                            </p>
-                          </div>
-                          <code className="session-command-code">{command.command ?? '(no command payload)'}</code>
-                          {command.preview ? <p className="session-command-preview">{command.preview}</p> : null}
-                        </li>
-                      ))}
-                    </ul>
-                  ) : (
-                    <p className="panel-inline-muted">No command activity captured for this session.</p>
-                  )}
-                </article>
-              </li>
-            ))}
+                    <p className="sessions-agent-item-meta">
+                      Running {group.runningCount} • Errors {group.errorCount}
+                    </p>
+                  </button>
+                </li>
+              )
+            })}
           </ul>
-        ) : null}
+        </aside>
+
+        <section className="sessions-center-pane" aria-label="Session groups">
+          <header className="sessions-pane-head">
+            <div>
+              <h3>Sessions</h3>
+              <p>Grouped by agent. Expand critical groups to inspect command activity quickly.</p>
+            </div>
+          </header>
+
+          <div className="sessions-center-controls">
+            <div className="sessions-monitor-filter-row">
+              <button
+                type="button"
+                className={cn('activity-filter-btn', statusFilter === 'all' && 'activity-filter-btn-active')}
+                onClick={() => setStatusFilter('all')}
+              >
+                All
+              </button>
+              <button
+                type="button"
+                className={cn('activity-filter-btn', statusFilter === 'running' && 'activity-filter-btn-active')}
+                onClick={() => setStatusFilter('running')}
+              >
+                Running
+              </button>
+              <button
+                type="button"
+                className={cn('activity-filter-btn', statusFilter === 'errors' && 'activity-filter-btn-active')}
+                onClick={() => setStatusFilter('errors')}
+              >
+                Errors
+              </button>
+              <button
+                type="button"
+                className={cn('activity-filter-btn', statusFilter === 'idle' && 'activity-filter-btn-active')}
+                onClick={() => setStatusFilter('idle')}
+              >
+                Idle
+              </button>
+            </div>
+
+            <div className="sessions-center-action-row">
+              <Button variant="ghost" onClick={expandAllAgents}>
+                Expand All
+              </Button>
+              <Button variant="ghost" onClick={collapseAllAgents}>
+                Collapse All
+              </Button>
+              <Button variant="ghost" onClick={expandCriticalAgents}>
+                Critical Only
+              </Button>
+            </div>
+
+            <div className="sessions-monitor-input-row">
+              <label className="sessions-monitor-input">
+                <span>Sessions</span>
+                <Input
+                  type="number"
+                  min={1}
+                  max={200}
+                  value={String(sessionLimit)}
+                  onChange={(event) => {
+                    const next = Number.parseInt(event.target.value, 10)
+                    if (Number.isFinite(next)) {
+                      setSessionLimit(Math.min(200, Math.max(1, next)))
+                    }
+                  }}
+                />
+              </label>
+              <label className="sessions-monitor-input">
+                <span>History / session</span>
+                <Input
+                  type="number"
+                  min={1}
+                  max={500}
+                  value={String(historyLimit)}
+                  onChange={(event) => {
+                    const next = Number.parseInt(event.target.value, 10)
+                    if (Number.isFinite(next)) {
+                      setHistoryLimit(Math.min(500, Math.max(1, next)))
+                    }
+                  }}
+                />
+              </label>
+            </div>
+
+            {effectiveSelectedAgentKeys.length > 0 ? (
+              <div className="sessions-active-filter-row">
+                {effectiveSelectedAgentKeys.map((agentKey) => (
+                  <button
+                    key={agentKey}
+                    type="button"
+                    className="sessions-filter-chip"
+                    onClick={() => toggleAgentSelection(agentKey)}
+                  >
+                    {selectedAgentLabelByKey.get(agentKey) ?? agentKey}
+                  </button>
+                ))}
+              </div>
+            ) : null}
+          </div>
+
+          <div className="sessions-center-body">
+            {sessionsQuery.uiError ? (
+              <p className="activity-feed-state">
+                <strong>{sessionsQuery.uiError.title}:</strong> {sessionsQuery.uiError.message}
+              </p>
+            ) : null}
+            {sessionsQuery.isLoading ? <p className="activity-feed-state">Loading session monitor...</p> : null}
+            {!sessionsQuery.isLoading && !sessionsQuery.uiError && groupedSessions.length === 0 ? (
+              <p className="activity-feed-state">No sessions match the current filters.</p>
+            ) : null}
+
+            {!sessionsQuery.isLoading && !sessionsQuery.uiError && groupedSessions.length > 0 ? (
+              <ul className="sessions-agent-groups">
+                {groupedSessions.map((group) => {
+                  const expanded = isAgentExpanded(group)
+                  return (
+                    <li key={group.key} className="sessions-agent-group">
+                      <button
+                        type="button"
+                        className="sessions-agent-group-head"
+                        onClick={() =>
+                          setExpandedAgentOverrides((previous) => ({
+                            ...previous,
+                            [group.key]: !expanded,
+                          }))
+                        }
+                      >
+                        <div className="sessions-agent-group-summary">
+                          <p className="sessions-agent-group-title">{group.label}</p>
+                          <p className="sessions-agent-group-meta">
+                            Sessions {group.totalSessions} • Updated{' '}
+                            {group.updatedAt ? formatUpdatedAtDisplay(group.updatedAt) : 'unknown'}
+                          </p>
+                        </div>
+                        <div className="sessions-agent-group-tags">
+                          <Tag tone={group.runningCount > 0 ? 'warning' : 'default'}>Running {group.runningCount}</Tag>
+                          <Tag tone={group.errorCount > 0 ? 'danger' : 'default'}>Errors {group.errorCount}</Tag>
+                          <Tag>{expanded ? 'Expanded' : 'Collapsed'}</Tag>
+                        </div>
+                      </button>
+
+                      {expanded ? (
+                        <ul className="sessions-agent-group-list">
+                          {group.sessions.map((session) => {
+                            const isSelected = selectedSession?.key === session.key
+                            const sessionLabelValue = `${agentLabelForSession(session)} / ${session.channel ?? 'unknown'} / ${shortSessionKey(
+                              session.key,
+                            )}`
+                            return (
+                              <li key={session.key}>
+                                <button
+                                  type="button"
+                                  className={cn('session-row-button', isSelected && 'session-row-button-active')}
+                                  onClick={() => setSelectedSessionKey(session.key)}
+                                >
+                                  <div className="session-row-head">
+                                    <div className="session-row-main">
+                                      <p className="session-row-title">{sessionLabelValue}</p>
+                                      <p className="session-row-sub">
+                                        {session.displayName ?? 'No display name'} • Updated{' '}
+                                        {session.updatedAt ? formatUpdatedAtDisplay(session.updatedAt) : 'unknown'}
+                                      </p>
+                                    </div>
+                                    <div className="session-row-tags">
+                                      <Tag tone={sessionTone(session)}>{sessionLabel(session.status)}</Tag>
+                                      <Tag tone={session.runningCount > 0 ? 'warning' : 'default'}>
+                                        Running {session.runningCount}
+                                      </Tag>
+                                      <Tag tone={session.errorCount > 0 ? 'danger' : 'default'}>Errors {session.errorCount}</Tag>
+                                    </div>
+                                  </div>
+
+                                  {session.tickets.length > 0 ? (
+                                    <div className="session-monitor-ticket-row">
+                                      {session.tickets.map((ticket) => (
+                                        <span key={ticket.id} className="session-ticket-chip">
+                                          TASK-{ticket.id} {ticket.title}
+                                        </span>
+                                      ))}
+                                    </div>
+                                  ) : null}
+
+                                  {session.lastCommandPreview ? (
+                                    <p className="session-row-preview">{session.lastCommandPreview}</p>
+                                  ) : (
+                                    <p className="panel-inline-muted">No command preview captured for this session.</p>
+                                  )}
+                                </button>
+                              </li>
+                            )
+                          })}
+                        </ul>
+                      ) : null}
+                    </li>
+                  )
+                })}
+              </ul>
+            ) : null}
+          </div>
+        </section>
+
+        <aside className="sessions-detail-pane" aria-label="Selected session detail">
+          <header className="sessions-pane-head">
+            <div>
+              <h3>Session Detail</h3>
+              <p>Full metadata and command timeline for the selected session.</p>
+            </div>
+          </header>
+
+          {selectedSession ? (
+            <div className="sessions-detail-body">
+              <p className="sessions-detail-key">{selectedSession.key}</p>
+              <p className="sessions-detail-meta">
+                Agent {agentLabelForSession(selectedSession)} • Channel {selectedSession.channel ?? 'unknown'} • Model{' '}
+                {selectedSession.model ?? 'unknown'}
+              </p>
+              <div className="sessions-detail-tags">
+                <Tag tone={sessionTone(selectedSession)}>{sessionLabel(selectedSession.status)}</Tag>
+                <Tag tone={selectedSession.runningCount > 0 ? 'warning' : 'default'}>
+                  Running {selectedSession.runningCount}
+                </Tag>
+                <Tag tone={selectedSession.errorCount > 0 ? 'danger' : 'default'}>Errors {selectedSession.errorCount}</Tag>
+              </div>
+
+              {selectedSession.historyError ? (
+                <p className="session-monitor-error">{selectedSession.historyError}</p>
+              ) : null}
+
+              {selectedSession.tickets.length > 0 ? (
+                <div className="sessions-detail-block">
+                  <p className="sessions-detail-label">Linked Tickets</p>
+                  <div className="session-monitor-ticket-row">
+                    {selectedSession.tickets.map((ticket) => (
+                      <span key={ticket.id} className="session-ticket-chip">
+                        TASK-{ticket.id} {ticket.title}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
+
+              <div className="sessions-detail-block">
+                <p className="sessions-detail-label">Commands</p>
+                {selectedSession.commands.length > 0 ? (
+                  <ul className="session-command-list">
+                    {selectedSession.commands.slice(0, 12).map((command) => (
+                      <li key={command.callId} className="session-command-row">
+                        <div className="session-command-head">
+                          <Tag tone={commandTone(command.status)}>{command.status}</Tag>
+                          <p className="session-command-time">
+                            {command.updatedAt ? formatUpdatedAtDisplay(command.updatedAt) : 'unknown'}
+                          </p>
+                        </div>
+                        <code className="session-command-code">{command.command ?? '(no command payload)'}</code>
+                        {command.preview ? <p className="session-command-preview">{command.preview}</p> : null}
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="panel-inline-muted">No command activity captured for this session.</p>
+                )}
+              </div>
+            </div>
+          ) : (
+            <p className="activity-feed-state">Select a session row to inspect details.</p>
+          )}
+        </aside>
       </Card>
     </section>
   )
@@ -1545,6 +1919,134 @@ function commandTone(status: string): 'default' | 'warning' | 'danger' {
     return 'warning'
   }
   return 'default'
+}
+
+function agentKeyForSession(session: GatewaySessionActivity): string {
+  const raw = (session.agentId ?? session.agentName ?? 'unknown').trim()
+  return raw ? raw.toLowerCase() : 'unknown'
+}
+
+function agentLabelForSession(session: GatewaySessionActivity): string {
+  const raw = (session.agentName ?? session.agentId ?? 'unknown').trim()
+  return raw || 'unknown'
+}
+
+function shortSessionKey(key: string): string {
+  const parts = key.split(':').filter((value) => value.length > 0)
+  if (parts.length >= 2) {
+    return parts.slice(-2).join(':')
+  }
+  if (key.length <= 26) {
+    return key
+  }
+  return `${key.slice(0, 12)}...${key.slice(-10)}`
+}
+
+function sessionUpdatedAtMs(session: GatewaySessionActivity): number {
+  if (!session.updatedAt) {
+    return 0
+  }
+  const parsed = new Date(session.updatedAt).getTime()
+  return Number.isFinite(parsed) ? parsed : 0
+}
+
+function sessionMatchesStatusFilter(
+  session: GatewaySessionActivity,
+  filter: 'all' | 'running' | 'errors' | 'idle',
+): boolean {
+  if (filter === 'running') {
+    return session.runningCount > 0
+  }
+  if (filter === 'errors') {
+    return session.errorCount > 0 || Boolean(session.historyError)
+  }
+  if (filter === 'idle') {
+    return session.commandCount <= 0 && session.runningCount <= 0
+  }
+  return true
+}
+
+function sessionSearchHaystack(session: GatewaySessionActivity): string {
+  return [
+    session.key,
+    session.status,
+    session.kind ?? '',
+    session.channel ?? '',
+    session.displayName ?? '',
+    session.agentId ?? '',
+    session.agentName ?? '',
+    session.lastCommandPreview ?? '',
+    ...session.tickets.map((ticket) => `${ticket.id} ${ticket.title} ${ticket.assignee}`),
+    ...session.commands.slice(0, 8).map((command) => `${command.toolName} ${command.command ?? ''} ${command.preview ?? ''}`),
+  ]
+    .join(' ')
+    .toLowerCase()
+}
+
+function sessionRank(session: GatewaySessionActivity): number {
+  if (session.errorCount > 0 || Boolean(session.historyError) || session.status.includes('error')) {
+    return 0
+  }
+  if (session.runningCount > 0 || ['running', 'active', 'queued', 'started'].includes(session.status)) {
+    return 1
+  }
+  return 2
+}
+
+function groupRank(group: AgentSessionGroup): number {
+  if (group.errorCount > 0) {
+    return 0
+  }
+  if (group.runningCount > 0) {
+    return 1
+  }
+  return 2
+}
+
+function buildAgentSessionGroups(sessions: GatewaySessionActivity[]): AgentSessionGroup[] {
+  const map = new Map<string, AgentSessionGroup>()
+
+  for (const session of sessions) {
+    const key = agentKeyForSession(session)
+    const existing = map.get(key)
+    if (!existing) {
+      map.set(key, {
+        key,
+        label: agentLabelForSession(session),
+        sessions: [session],
+        totalSessions: 1,
+        runningCount: session.runningCount,
+        errorCount: session.errorCount > 0 || Boolean(session.historyError) ? 1 : 0,
+        updatedAtMs: sessionUpdatedAtMs(session),
+        updatedAt: session.updatedAt,
+      })
+      continue
+    }
+
+    existing.sessions.push(session)
+    existing.totalSessions += 1
+    existing.runningCount += session.runningCount
+    if (session.errorCount > 0 || Boolean(session.historyError)) {
+      existing.errorCount += 1
+    }
+
+    const updatedMs = sessionUpdatedAtMs(session)
+    if (updatedMs > existing.updatedAtMs) {
+      existing.updatedAtMs = updatedMs
+      existing.updatedAt = session.updatedAt
+    }
+  }
+
+  const groups = Array.from(map.values())
+  groups.sort((left, right) => {
+    const rankDiff = groupRank(left) - groupRank(right)
+    if (rankDiff !== 0) {
+      return rankDiff
+    }
+    return right.updatedAtMs - left.updatedAtMs
+  })
+
+  return groups
 }
 
 function mergeTickets(
