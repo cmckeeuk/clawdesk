@@ -9,7 +9,7 @@ import shutil
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set, TypeVar
 from urllib.parse import unquote, urlparse
 
 import httpx
@@ -177,11 +177,38 @@ agent_cache: Dict[str, Any] = {
     "expires_at": 0.0,
 }
 
+WRITE_RETRY_ATTEMPTS = 5
+WRITE_RETRY_INITIAL_BACKOFF_SECONDS = 0.05
+T = TypeVar("T")
+
+
+def run_with_write_retry(action: Callable[[], T]) -> T:
+    delay_seconds = WRITE_RETRY_INITIAL_BACKOFF_SECONDS
+    for attempt in range(WRITE_RETRY_ATTEMPTS + 1):
+        try:
+            return action()
+        except sqlite3.OperationalError as exc:
+            if "database is locked" not in str(exc).lower() or attempt >= WRITE_RETRY_ATTEMPTS:
+                raise
+            time.sleep(delay_seconds)
+            delay_seconds *= 2
+    raise RuntimeError("unreachable")
+
+
+def execute_write(conn: sqlite3.Connection, query: str, params: tuple[Any, ...] = ()) -> sqlite3.Cursor:
+    return run_with_write_retry(lambda: conn.execute(query, params))
+
+
+def commit_write(conn: sqlite3.Connection) -> None:
+    run_with_write_retry(conn.commit)
+
 
 @contextmanager
 def get_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
     try:
         yield conn
     finally:
@@ -242,7 +269,8 @@ def init_db() -> None:
 
 def create_event(conn: sqlite3.Connection, ticket_id: int, event_type: str, actor: str, details: str) -> Dict[str, Any]:
     ts = now_iso()
-    cursor = conn.execute(
+    cursor = execute_write(
+        conn,
         "INSERT INTO ticket_events (ticket_id, event_type, actor, details, created_at) VALUES (?, ?, ?, ?, ?)",
         (ticket_id, event_type, actor, details, ts),
     )
@@ -258,7 +286,8 @@ def create_event(conn: sqlite3.Connection, ticket_id: int, event_type: str, acto
 
 def create_comment(conn: sqlite3.Connection, ticket_id: int, author: str, content: str) -> Dict[str, Any]:
     ts = now_iso()
-    cursor = conn.execute(
+    cursor = execute_write(
+        conn,
         "INSERT INTO ticket_comments (ticket_id, author, content, created_at) VALUES (?, ?, ?, ?)",
         (ticket_id, author, content, ts),
     )
@@ -1329,7 +1358,7 @@ def build_spawn_prompt(ticket: Dict[str, Any], status: str) -> str:
     )
 
 
-async def spawn_agent_for_ticket(ticket: Dict[str, Any], status: str) -> Dict[str, Any]:
+async def spawn_agent_for_ticket(ticket: Dict[str, Any], status: str, session_suffix: Optional[str] = None) -> Dict[str, Any]:
     assignee = (ticket.get("assignee") or "").strip()
     if not OPENCLAW_TOKEN:
         return {"attempted": False, "spawned": False, "reason": "OPENCLAW_TOKEN is not configured"}
@@ -1345,15 +1374,20 @@ async def spawn_agent_for_ticket(ticket: Dict[str, Any], status: str) -> Dict[st
             "reason": f"No configured gateway agent found for assignee '{assignee}'",
         }
 
+    # Route each ticket into its own agent session to avoid cross-ticket queue
+    # contention in a single shared agent:main session.
+    session_key = f"agent:{agent_id}:ticket:{ticket['id']}"
+    if isinstance(session_suffix, str) and session_suffix.strip():
+        session_key = f"{session_key}:{session_suffix.strip()}"
     payload_args = {
+        "sessionKey": session_key,
         "agentId": agent_id,
-        "task": build_spawn_prompt(ticket, status),
-        "label": f"ticket-{ticket['id']}",
-        "cleanup": "keep",
+        "message": build_spawn_prompt(ticket, status),
+        "timeoutSeconds": 90,
     }
 
     try:
-        response = await call_openclaw_tool("sessions_spawn", payload_args, timeout_seconds=75.0)
+        await call_openclaw_tool("sessions_send", payload_args, timeout_seconds=30.0)
     except HTTPException as exc:
         return {
             "attempted": True,
@@ -1361,71 +1395,17 @@ async def spawn_agent_for_ticket(ticket: Dict[str, Any], status: str) -> Dict[st
             "reason": str(exc.detail),
         }
 
-    result = response.get("result", {})
-    details: Dict[str, Any] = {}
-    parsed_content: Dict[str, Any] = {}
-
-    if isinstance(result, dict):
-        maybe_details = result.get("details")
-        if isinstance(maybe_details, dict):
-            details = maybe_details
-
-        content = result.get("content")
-        if isinstance(content, list) and content:
-            first = content[0]
-            if isinstance(first, dict):
-                text = first.get("text")
-                if isinstance(text, str):
-                    try:
-                        parsed = json.loads(text)
-                        if isinstance(parsed, dict):
-                            parsed_content = parsed
-                    except json.JSONDecodeError:
-                        pass
-
-    status = details.get("status") or parsed_content.get("status")
-    error = details.get("error") or parsed_content.get("error")
-
-    # OpenClaw may return ok=true even when details.status=error.
-    if status == "error" or error:
-        reason = str(error or "sessions_spawn returned status=error")
-        return {
-            "attempted": True,
-            "spawned": False,
-            "reason": reason,
-            "status": status or "error",
-        }
-
-    session_key = (
-        details.get("childSessionKey")
-        or parsed_content.get("childSessionKey")
-        or (result.get("childSessionKey") if isinstance(result, dict) else None)
-    )
-    run_id = (
-        details.get("runId")
-        or parsed_content.get("runId")
-        or (result.get("runId") if isinstance(result, dict) else None)
-    )
-
-    if not session_key:
-        return {
-            "attempted": True,
-            "spawned": False,
-            "reason": "sessions_spawn returned no childSessionKey",
-        }
-
     return {
         "attempted": True,
         "spawned": True,
         "session_key": session_key,
         "agent_id": agent_id,
-        "run_id": run_id,
     }
 
 
-async def ensure_agent_session(ticket: Dict[str, Any], status: str) -> Dict[str, Any]:
+async def ensure_agent_session(ticket: Dict[str, Any], status: str, force_new: bool = False) -> Dict[str, Any]:
     existing_key = str(ticket.get("agent_session_key") or "").strip()
-    if existing_key:
+    if existing_key and not force_new:
         live = await is_session_live(existing_key)
         if live.get("live"):
             return {
@@ -1436,10 +1416,88 @@ async def ensure_agent_session(ticket: Dict[str, Any], status: str) -> Dict[str,
                 "reason": "Reused existing live session",
             }
 
-    spawn = await spawn_agent_for_ticket(ticket, status)
+    session_suffix = f"run-{int(time.time())}" if force_new else None
+    spawn = await spawn_agent_for_ticket(ticket, status, session_suffix=session_suffix)
     if spawn.get("spawned"):
         spawn["reused"] = False
     return spawn
+
+
+async def process_ticket_pickup_async(
+    ticket_id: int,
+    target_status: str,
+    actor: str,
+    force_new_session: bool = False,
+) -> None:
+    try:
+        comments_to_broadcast: List[Dict[str, Any]] = []
+        events_to_broadcast: List[Dict[str, Any]] = []
+        updated_ticket: Optional[Dict[str, Any]] = None
+        with get_db() as conn:
+            row = conn.execute("SELECT * FROM tickets WHERE id = ?", (ticket_id,)).fetchone()
+            if not row:
+                return
+
+            ticket = row_to_dict(row)
+            if ticket.get("archived_at"):
+                return
+            if ticket.get("status") != target_status:
+                return
+            if target_status not in AUTOMATION_TRIGGER_STATUSES:
+                return
+
+            session_result = await ensure_agent_session(ticket, target_status, force_new=force_new_session)
+            if session_result.get("reused"):
+                reuse_event = create_event(
+                    conn,
+                    ticket_id,
+                    "agent_reused",
+                    actor,
+                    f"Reused existing session {session_result.get('session_key')} on status {target_status}",
+                )
+                events_to_broadcast.append(reuse_event)
+            elif session_result.get("spawned"):
+                session_key = session_result.get("session_key")
+                execute_write(
+                    conn,
+                    "UPDATE tickets SET agent_session_key = ?, updated_at = ? WHERE id = ?",
+                    (session_key, now_iso(), ticket_id),
+                )
+                spawn_event = create_event(
+                    conn,
+                    ticket_id,
+                    "agent_spawned",
+                    actor,
+                    f"Assignee {ticket['assignee']} mapped to {session_result.get('agent_id')} session={session_key} on status {target_status}",
+                )
+                comment = create_comment(
+                    conn,
+                    ticket_id,
+                    "System",
+                    f"Agent pickup started for **{ticket['assignee']}** on **{target_status}**. Session: `{session_key}`",
+                )
+                comments_to_broadcast.append(comment)
+                events_to_broadcast.append(spawn_event)
+            else:
+                reason = session_result.get("reason", "unknown")
+                failure_event = create_event(conn, ticket_id, "agent_spawn_failed", actor, reason)
+                comment = create_comment(conn, ticket_id, "System", f"Agent pickup failed: {reason}")
+                comments_to_broadcast.append(comment)
+                events_to_broadcast.append(failure_event)
+
+            commit_write(conn)
+            final_row = conn.execute("SELECT * FROM tickets WHERE id = ?", (ticket_id,)).fetchone()
+            if final_row:
+                updated_ticket = row_to_dict(final_row)
+
+        if updated_ticket is not None:
+            await manager.broadcast({"type": "ticket_updated", "ticket": updated_ticket})
+        for event in events_to_broadcast:
+            await manager.broadcast({"type": "ticket_event", "event": event})
+        for comment in comments_to_broadcast:
+            await manager.broadcast({"type": "comment_added", "ticket_id": ticket_id, "comment": comment})
+    except Exception as exc:
+        print(f"process_ticket_pickup_async failed for ticket {ticket_id}: {exc}")
 
 
 def build_comment_followup_prompt(ticket: Dict[str, Any], comment: Dict[str, Any]) -> str:
@@ -1471,6 +1529,15 @@ async def notify_agent_on_comment(ticket: Dict[str, Any], comment: Dict[str, Any
     author = str(comment.get("author") or "").strip().lower()
     if assignee and author and assignee == author:
         return {"attempted": False, "notified": False, "reason": "Comment authored by assignee"}
+    if author in {"system", "agent", "automation"}:
+        return {"attempted": False, "notified": False, "reason": "System/automation comment"}
+
+    content_text = str(comment.get("content") or "").strip()
+    normalized_content = content_text.upper()
+    if normalized_content in {"NO_REPLY", "ANNOUNCE_SKIP"}:
+        return {"attempted": False, "notified": False, "reason": "Control message ignored"}
+    if normalized_content.startswith("AGENT-TO-AGENT ANNOUNCE STEP"):
+        return {"attempted": False, "notified": False, "reason": "Control message ignored"}
 
     prompt = build_comment_followup_prompt(ticket, comment)
     payload_args = {
@@ -1752,6 +1819,7 @@ async def gateway_sessions_activity(session_limit: int = 200, history_limit: int
         if key:
             history_messages: List[Dict[str, Any]] = []
             history_errors: List[str] = []
+            history_success = False
             history_contexts = sessions_history_contexts(key, agent_id)
             async with semaphore:
                 for context_key in history_contexts:
@@ -1766,9 +1834,10 @@ async def gateway_sessions_activity(session_limit: int = 200, history_limit: int
                         history_errors.append(str(exc.detail))
                         continue
 
+                    history_success = True
                     history_result = parse_sessions_history_result(history_response)
                     candidate_messages = history_result.get("messages")
-                    if isinstance(candidate_messages, list) and candidate_messages:
+                    if isinstance(candidate_messages, list):
                         history_messages = candidate_messages
                         break
 
@@ -1777,7 +1846,7 @@ async def gateway_sessions_activity(session_limit: int = 200, history_limit: int
                         history_errors.append(error_message.strip())
 
             commands = extract_command_runs(history_messages)
-            if not commands and history_errors:
+            if not commands and history_errors and not history_success:
                 unique_errors: List[str] = []
                 seen_errors: Set[str] = set()
                 for error_value in history_errors:
@@ -1802,6 +1871,12 @@ async def gateway_sessions_activity(session_limit: int = 200, history_limit: int
             if isinstance(last_command, dict) and isinstance(last_command.get("preview"), str)
             else None
         )
+        last_command_ts = normalize_gateway_timestamp(last_command_at)
+        last_command_at_ms = int(last_command_ts.get("ms") or 0)
+        activity_at_ms = max(updated_at_ms, last_command_at_ms)
+        activity_at = updated_at
+        if last_command_at_ms >= updated_at_ms and last_command_ts.get("iso"):
+            activity_at = str(last_command_ts.get("iso"))
 
         return {
             "key": key,
@@ -1813,6 +1888,7 @@ async def gateway_sessions_activity(session_limit: int = 200, history_limit: int
             "agentId": agent_id,
             "agentName": agent_name,
             "updatedAt": updated_at,
+            "activityAt": activity_at,
             "commandCount": len(commands),
             "runningCount": running_count,
             "errorCount": error_count,
@@ -1823,14 +1899,23 @@ async def gateway_sessions_activity(session_limit: int = 200, history_limit: int
             "tickets": ticket_map.get(key, []),
             "commands": commands,
             "_updatedAtMs": updated_at_ms,
+            "_activityAtMs": activity_at_ms,
             "_index": index,
         }
 
     session_rows = await asyncio.gather(*[build_session_activity(session, idx) for idx, session in enumerate(sessions)])
-    session_rows.sort(key=lambda row: (int(row.get("_updatedAtMs") or 0), -int(row.get("_index") or 0)), reverse=True)
+    session_rows.sort(
+        key=lambda row: (
+            int(row.get("_activityAtMs") or 0),
+            int(row.get("_updatedAtMs") or 0),
+            -int(row.get("_index") or 0),
+        ),
+        reverse=True,
+    )
     session_rows = session_rows[:session_limit]
     for row in session_rows:
         row.pop("_updatedAtMs", None)
+        row.pop("_activityAtMs", None)
         row.pop("_index", None)
 
     response: Dict[str, Any] = {
@@ -2173,7 +2258,8 @@ async def create_ticket(ticket: TicketCreate) -> Dict[str, Any]:
     ts = now_iso()
 
     with get_db() as conn:
-        cursor = conn.execute(
+        cursor = execute_write(
+            conn,
             """
             INSERT INTO tickets (title, description, status, assignee, priority, archived_at, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -2183,7 +2269,7 @@ async def create_ticket(ticket: TicketCreate) -> Dict[str, Any]:
         ticket_id = cursor.lastrowid
 
         event = create_event(conn, ticket_id, "ticket_created", "User", f"Created ticket: {ticket.title}")
-        conn.commit()
+        commit_write(conn)
 
         row = conn.execute("SELECT * FROM tickets WHERE id = ?", (ticket_id,)).fetchone()
         created = row_to_dict(row)
@@ -2245,7 +2331,7 @@ async def update_ticket(ticket_id: int, update: TicketUpdate) -> Dict[str, Any]:
         params.append(now_iso())
         params.append(ticket_id)
 
-        conn.execute(f"UPDATE tickets SET {', '.join(fields)} WHERE id = ?", params)
+        execute_write(conn, f"UPDATE tickets SET {', '.join(fields)} WHERE id = ?", tuple(params))
         event = create_event(conn, ticket_id, "ticket_updated", "User", "; ".join(change_summary))
         if docs_move_details:
             docs_move_event = create_event(
@@ -2255,7 +2341,7 @@ async def update_ticket(ticket_id: int, update: TicketUpdate) -> Dict[str, Any]:
                 "User",
                 f"{docs_move_details['from']} -> {docs_move_details['to']}",
             )
-        conn.commit()
+        commit_write(conn)
 
         updated = row_to_dict(conn.execute("SELECT * FROM tickets WHERE id = ?", (ticket_id,)).fetchone())
 
@@ -2278,12 +2364,13 @@ async def archive_ticket(ticket_id: int, actor: str = "User") -> Dict[str, Any]:
             return current
 
         ts = now_iso()
-        conn.execute(
+        execute_write(
+            conn,
             "UPDATE tickets SET archived_at = ?, updated_at = ? WHERE id = ?",
             (ts, ts, ticket_id),
         )
         event = create_event(conn, ticket_id, "ticket_archived", actor, f"Archived from {current['status']}")
-        conn.commit()
+        commit_write(conn)
 
         archived_ticket = row_to_dict(conn.execute("SELECT * FROM tickets WHERE id = ?", (ticket_id,)).fetchone())
 
@@ -2296,9 +2383,10 @@ async def archive_ticket(ticket_id: int, actor: str = "User") -> Dict[str, Any]:
 @app.post("/api/tickets/{ticket_id}/move")
 async def move_ticket(ticket_id: int, status: str, actor: str = "User") -> Dict[str, Any]:
     warnings: List[str] = []
-    comments_to_broadcast: List[Dict[str, Any]] = []
     events_to_broadcast: List[Dict[str, Any]] = []
     pickup: Dict[str, Any] = {"attempted": False, "spawned": False}
+    should_schedule_pickup = False
+    force_new_session = False
 
     with get_db() as conn:
         row = conn.execute("SELECT * FROM tickets WHERE id = ?", (ticket_id,)).fetchone()
@@ -2312,7 +2400,8 @@ async def move_ticket(ticket_id: int, status: str, actor: str = "User") -> Dict[
         validate_transition(old_status, status)
 
         if old_status != status:
-            conn.execute(
+            execute_write(
+                conn,
                 "UPDATE tickets SET status = ?, updated_at = ? WHERE id = ?",
                 (status, now_iso(), ticket_id),
             )
@@ -2322,45 +2411,11 @@ async def move_ticket(ticket_id: int, status: str, actor: str = "User") -> Dict[
         updated = row_to_dict(conn.execute("SELECT * FROM tickets WHERE id = ?", (ticket_id,)).fetchone())
 
         if old_status != status and status in AUTOMATION_TRIGGER_STATUSES:
-            session_result = await ensure_agent_session(updated, status)
-            pickup = session_result
-            if session_result.get("reused"):
-                reuse_event = create_event(
-                    conn,
-                    ticket_id,
-                    "agent_reused",
-                    actor,
-                    f"Reused existing session {session_result.get('session_key')} on status {status}",
-                )
-                events_to_broadcast.append(reuse_event)
-            elif session_result.get("spawned"):
-                session_key = session_result.get("session_key")
-                conn.execute(
-                    "UPDATE tickets SET agent_session_key = ?, updated_at = ? WHERE id = ?",
-                    (session_key, now_iso(), ticket_id),
-                )
-                spawn_event = create_event(
-                    conn,
-                    ticket_id,
-                    "agent_spawned",
-                    actor,
-                    f"Assignee {updated['assignee']} mapped to {session_result.get('agent_id')} session={session_key} on status {status}",
-                )
-                comment = create_comment(
-                    conn,
-                    ticket_id,
-                    "System",
-                    f"Agent pickup started for **{updated['assignee']}** on **{status}**. Session: `{session_key}`",
-                )
-                comments_to_broadcast.append(comment)
-                events_to_broadcast.append(spawn_event)
-            else:
-                reason = session_result.get("reason", "unknown")
-                warnings.append(reason)
-                failure_event = create_event(conn, ticket_id, "agent_spawn_failed", actor, reason)
-                comment = create_comment(conn, ticket_id, "System", f"Agent pickup failed: {reason}")
-                comments_to_broadcast.append(comment)
-                events_to_broadcast.append(failure_event)
+            # Re-opened work (e.g. Review -> In Progress) should start in a fresh
+            # ticket session to avoid stale context from previous runs.
+            force_new_session = old_status not in AUTOMATION_TRIGGER_STATUSES
+            should_schedule_pickup = True
+            pickup = {"attempted": True, "spawned": False, "scheduled": True}
 
         if (
             old_status != status
@@ -2369,7 +2424,8 @@ async def move_ticket(ticket_id: int, status: str, actor: str = "User") -> Dict[
             and str(updated.get("agent_session_key") or "").strip()
         ):
             previous_session_key = str(updated.get("agent_session_key") or "").strip()
-            conn.execute(
+            execute_write(
+                conn,
                 "UPDATE tickets SET agent_session_key = NULL, updated_at = ? WHERE id = ?",
                 (now_iso(), ticket_id),
             )
@@ -2382,7 +2438,7 @@ async def move_ticket(ticket_id: int, status: str, actor: str = "User") -> Dict[
             )
             events_to_broadcast.append(deactivate_event)
 
-        conn.commit()
+        commit_write(conn)
         final_ticket = row_to_dict(conn.execute("SELECT * FROM tickets WHERE id = ?", (ticket_id,)).fetchone())
 
     await manager.broadcast({
@@ -2396,8 +2452,15 @@ async def move_ticket(ticket_id: int, status: str, actor: str = "User") -> Dict[
     for event in events_to_broadcast:
         await manager.broadcast({"type": "ticket_event", "event": event})
 
-    for comment in comments_to_broadcast:
-        await manager.broadcast({"type": "comment_added", "ticket_id": ticket_id, "comment": comment})
+    if should_schedule_pickup:
+        asyncio.create_task(
+            process_ticket_pickup_async(
+                ticket_id=ticket_id,
+                target_status=status,
+                actor=actor,
+                force_new_session=force_new_session,
+            )
+        )
 
     return {
         "ok": True,
@@ -2434,7 +2497,7 @@ async def add_ticket_comment(ticket_id: int, comment: CommentCreate) -> Dict[str
         current_ticket = row_to_dict(row)
         created = create_comment(conn, ticket_id, comment.author, comment.content)
         event = create_event(conn, ticket_id, "comment_added", comment.author, comment.content[:300])
-        conn.commit()
+        commit_write(conn)
 
     followup_event: Optional[Dict[str, Any]] = None
     respawn_event: Optional[Dict[str, Any]] = None
@@ -2443,7 +2506,8 @@ async def add_ticket_comment(ticket_id: int, comment: CommentCreate) -> Dict[str
         if notify_result.get("attempted"):
             with get_db() as conn:
                 if notify_result.get("respawned") and notify_result.get("session_key"):
-                    conn.execute(
+                    execute_write(
+                        conn,
                         "UPDATE tickets SET agent_session_key = ?, updated_at = ? WHERE id = ?",
                         (notify_result.get("session_key"), now_iso(), ticket_id),
                     )
@@ -2471,7 +2535,7 @@ async def add_ticket_comment(ticket_id: int, comment: CommentCreate) -> Dict[str
                         "System",
                         str(notify_result.get("reason") or "Unknown notification failure"),
                     )
-                conn.commit()
+                commit_write(conn)
 
     await manager.broadcast({"type": "comment_added", "ticket_id": ticket_id, "comment": created})
     await manager.broadcast({"type": "ticket_event", "event": event})

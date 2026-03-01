@@ -231,6 +231,7 @@ export type GatewaySessionActivity = {
   agentId: string | null
   agentName: string | null
   updatedAt: string | null
+  activityAt: string | null
   commandCount: number
   runningCount: number
   errorCount: number

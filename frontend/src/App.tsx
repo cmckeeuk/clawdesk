@@ -104,6 +104,17 @@ type AgentSessionGroup = {
   updatedAt: string | null
 }
 
+type ParsedSessionKey =
+  | { type: 'main'; agentId: string }
+  | { type: 'ticket'; agentId: string; ticketId: string; runId: string | null }
+  | { type: 'subagent'; agentId: string; subagentId: string }
+  | { type: 'unknown' }
+
+type SessionDisplaySummary = {
+  title: string
+  channelLabel: string
+}
+
 const NAV_ITEMS: NavItem[] = [
   { label: 'Dashboard', path: '/dashboard', iconSrc: kanbanIcon },
   { label: 'Workspace', path: '/workspace', iconSrc: filesIcon },
@@ -1301,6 +1312,7 @@ function SessionsMonitorPage() {
   const [statusFilter, setStatusFilter] = useState<'all' | 'running' | 'errors' | 'idle'>('all')
   const [agentFocus, setAgentFocus] = useState<'all' | 'running' | 'errors' | 'idle'>('all')
   const [agentSearchValue, setAgentSearchValue] = useState('')
+  const [sessionSearchValue, setSessionSearchValue] = useState('')
   const [selectedAgentKeys, setSelectedAgentKeys] = useState<string[]>([])
   const [expandedAgentOverrides, setExpandedAgentOverrides] = useState<Record<string, boolean>>({})
   const [selectedSessionKey, setSelectedSessionKey] = useState<string | null>(null)
@@ -1310,19 +1322,27 @@ function SessionsMonitorPage() {
 
   const sessions = useMemo(() => sessionsQuery.data?.sessions ?? [], [sessionsQuery.data?.sessions])
   const filteredSessions = useMemo(() => {
-    const search = searchValue.trim().toLowerCase()
+    const globalSearch = searchValue.trim().toLowerCase()
+    const sessionSearch = sessionSearchValue.trim().toLowerCase()
 
     return sessions.filter((session) => {
       if (!sessionMatchesStatusFilter(session, statusFilter)) {
         return false
       }
-      if (!search) {
-        return true
+
+      const haystack = sessionSearchHaystack(session)
+
+      if (globalSearch && !haystack.includes(globalSearch)) {
+        return false
       }
 
-      return sessionSearchHaystack(session).includes(search)
+      if (sessionSearch && !haystack.includes(sessionSearch)) {
+        return false
+      }
+
+      return true
     })
-  }, [searchValue, sessions, statusFilter])
+  }, [searchValue, sessionSearchValue, sessions, statusFilter])
 
   const allAgentGroups = useMemo(() => buildAgentSessionGroups(sessions), [sessions])
   const agentRailGroups = useMemo(() => {
@@ -1378,8 +1398,8 @@ function SessionsMonitorPage() {
           totalSessions: 1,
           runningCount: session.runningCount,
           errorCount: session.errorCount > 0 || Boolean(session.historyError) ? 1 : 0,
-          updatedAtMs: sessionUpdatedAtMs(session),
-          updatedAt: session.updatedAt,
+          updatedAtMs: sessionActivityAtMs(session),
+          updatedAt: session.activityAt ?? session.updatedAt,
         })
         continue
       }
@@ -1391,32 +1411,19 @@ function SessionsMonitorPage() {
         existing.errorCount += 1
       }
 
-      const updatedAtMs = sessionUpdatedAtMs(session)
+      const updatedAtMs = sessionActivityAtMs(session)
       if (updatedAtMs > existing.updatedAtMs) {
         existing.updatedAtMs = updatedAtMs
-        existing.updatedAt = session.updatedAt
+        existing.updatedAt = session.activityAt ?? session.updatedAt
       }
     }
 
     const groups = Array.from(map.values())
     for (const group of groups) {
-      group.sessions.sort((left, right) => {
-        const rankDiff = sessionRank(left) - sessionRank(right)
-        if (rankDiff !== 0) {
-          return rankDiff
-        }
-        return sessionUpdatedAtMs(right) - sessionUpdatedAtMs(left)
-      })
+      group.sessions.sort((left, right) => sessionActivityAtMs(right) - sessionActivityAtMs(left))
     }
 
-    groups.sort((left, right) => {
-      const leftRank = groupRank(left)
-      const rightRank = groupRank(right)
-      if (leftRank !== rightRank) {
-        return leftRank - rightRank
-      }
-      return right.updatedAtMs - left.updatedAtMs
-    })
+    groups.sort((left, right) => right.updatedAtMs - left.updatedAtMs)
 
     return groups
   }, [filteredSessions, selectedAgentSet])
@@ -1438,6 +1445,10 @@ function SessionsMonitorPage() {
     }
     return visibleSessions.find((session) => session.key === effectiveSelectedSessionKey) ?? null
   }, [effectiveSelectedSessionKey, visibleSessions])
+  const selectedSessionDisplay = useMemo(
+    () => (selectedSession ? formatSessionDisplaySummary(selectedSession) : null),
+    [selectedSession],
+  )
 
   const activeAgents = allAgentGroups.length
   const runningCommands = useMemo(
@@ -1603,6 +1614,15 @@ function SessionsMonitorPage() {
           </header>
 
           <div className="sessions-center-controls">
+            <label className="sessions-monitor-input sessions-monitor-search-input">
+              <span>Find session</span>
+              <Input
+                value={sessionSearchValue}
+                onChange={(event) => setSessionSearchValue(event.target.value)}
+                placeholder="Filter sessions by key, agent, channel, command, or ticket"
+              />
+            </label>
+
             <div className="sessions-monitor-filter-row">
               <button
                 type="button"
@@ -1643,6 +1663,16 @@ function SessionsMonitorPage() {
               </Button>
               <Button variant="ghost" onClick={expandCriticalAgents}>
                 Critical Only
+              </Button>
+              <Button
+                variant="ghost"
+                onClick={() => {
+                  setStatusFilter('all')
+                  setSessionSearchValue('')
+                  setSelectedAgentKeys([])
+                }}
+              >
+                Reset Filters
               </Button>
             </div>
 
@@ -1740,9 +1770,7 @@ function SessionsMonitorPage() {
                         <ul className="sessions-agent-group-list">
                           {group.sessions.map((session) => {
                             const isSelected = selectedSession?.key === session.key
-                            const sessionLabelValue = `${agentLabelForSession(session)} / ${session.channel ?? 'unknown'} / ${shortSessionKey(
-                              session.key,
-                            )}`
+                            const sessionDisplay = formatSessionDisplaySummary(session)
                             return (
                               <li key={session.key}>
                                 <button
@@ -1752,9 +1780,10 @@ function SessionsMonitorPage() {
                                 >
                                   <div className="session-row-head">
                                     <div className="session-row-main">
-                                      <p className="session-row-title">{sessionLabelValue}</p>
+                                      <p className="session-row-title">{sessionDisplay.title}</p>
                                       <p className="session-row-sub">
-                                        {session.displayName ?? 'No display name'} • Updated{' '}
+                                        {session.displayName ?? 'No display name'} • Channel {sessionDisplay.channelLabel}
+                                        • Updated{' '}
                                         {session.updatedAt ? formatUpdatedAtDisplay(session.updatedAt) : 'unknown'}
                                       </p>
                                     </div>
@@ -1808,7 +1837,8 @@ function SessionsMonitorPage() {
             <div className="sessions-detail-body">
               <p className="sessions-detail-key">{selectedSession.key}</p>
               <p className="sessions-detail-meta">
-                Agent {agentLabelForSession(selectedSession)} • Channel {selectedSession.channel ?? 'unknown'} • Model{' '}
+                {selectedSessionDisplay?.title ?? 'unknown'} • Channel {selectedSessionDisplay?.channelLabel ?? 'unknown'} •
+                {' '}Model{' '}
                 {selectedSession.model ?? 'unknown'}
               </p>
               <div className="sessions-detail-tags">
@@ -1931,6 +1961,76 @@ function agentLabelForSession(session: GatewaySessionActivity): string {
   return raw || 'unknown'
 }
 
+function parseSessionKey(key: string): ParsedSessionKey {
+  const mainMatch = /^agent:([^:]+):main$/.exec(key)
+  if (mainMatch) {
+    return {
+      type: 'main',
+      agentId: mainMatch[1],
+    }
+  }
+
+  const ticketMatch = /^agent:([^:]+):ticket:([^:]+)(?::run-([^:]+))?$/.exec(key)
+  if (ticketMatch) {
+    return {
+      type: 'ticket',
+      agentId: ticketMatch[1],
+      ticketId: ticketMatch[2],
+      runId: ticketMatch[3] ?? null,
+    }
+  }
+
+  const subagentMatch = /^agent:([^:]+):subagent:([^:]+)$/.exec(key)
+  if (subagentMatch) {
+    return {
+      type: 'subagent',
+      agentId: subagentMatch[1],
+      subagentId: subagentMatch[2],
+    }
+  }
+
+  return { type: 'unknown' }
+}
+
+function shortIdentifier(value: string): string {
+  if (value.length <= 12) {
+    return value
+  }
+  return `${value.slice(0, 6)}...${value.slice(-4)}`
+}
+
+function formatSessionDisplaySummary(session: GatewaySessionActivity): SessionDisplaySummary {
+  const parsed = parseSessionKey(session.key)
+  const fallbackAgentLabel = agentLabelForSession(session)
+
+  if (parsed.type === 'main') {
+    return {
+      title: `${parsed.agentId} • main session`,
+      channelLabel: session.channel ?? 'unknown',
+    }
+  }
+
+  if (parsed.type === 'ticket') {
+    const runSegment = parsed.runId ? ` • run ${parsed.runId}` : ''
+    return {
+      title: `${parsed.agentId} • ticket #${parsed.ticketId}${runSegment}`,
+      channelLabel: 'automation',
+    }
+  }
+
+  if (parsed.type === 'subagent') {
+    return {
+      title: `${parsed.agentId} • subagent ${shortIdentifier(parsed.subagentId)}`,
+      channelLabel: 'automation',
+    }
+  }
+
+  return {
+    title: `${fallbackAgentLabel} • ${shortSessionKey(session.key)}`,
+    channelLabel: session.channel ?? 'unknown',
+  }
+}
+
 function shortSessionKey(key: string): string {
   const parts = key.split(':').filter((value) => value.length > 0)
   if (parts.length >= 2) {
@@ -1942,12 +2042,20 @@ function shortSessionKey(key: string): string {
   return `${key.slice(0, 12)}...${key.slice(-10)}`
 }
 
-function sessionUpdatedAtMs(session: GatewaySessionActivity): number {
-  if (!session.updatedAt) {
+function parseTimestampMs(value: string | null | undefined): number {
+  if (!value) {
     return 0
   }
-  const parsed = new Date(session.updatedAt).getTime()
+  const parsed = new Date(value).getTime()
   return Number.isFinite(parsed) ? parsed : 0
+}
+
+function sessionUpdatedAtMs(session: GatewaySessionActivity): number {
+  return parseTimestampMs(session.updatedAt)
+}
+
+function sessionActivityAtMs(session: GatewaySessionActivity): number {
+  return Math.max(parseTimestampMs(session.activityAt), sessionUpdatedAtMs(session))
 }
 
 function sessionMatchesStatusFilter(
@@ -1983,26 +2091,6 @@ function sessionSearchHaystack(session: GatewaySessionActivity): string {
     .toLowerCase()
 }
 
-function sessionRank(session: GatewaySessionActivity): number {
-  if (session.errorCount > 0 || Boolean(session.historyError) || session.status.includes('error')) {
-    return 0
-  }
-  if (session.runningCount > 0 || ['running', 'active', 'queued', 'started'].includes(session.status)) {
-    return 1
-  }
-  return 2
-}
-
-function groupRank(group: AgentSessionGroup): number {
-  if (group.errorCount > 0) {
-    return 0
-  }
-  if (group.runningCount > 0) {
-    return 1
-  }
-  return 2
-}
-
 function buildAgentSessionGroups(sessions: GatewaySessionActivity[]): AgentSessionGroup[] {
   const map = new Map<string, AgentSessionGroup>()
 
@@ -2017,8 +2105,8 @@ function buildAgentSessionGroups(sessions: GatewaySessionActivity[]): AgentSessi
         totalSessions: 1,
         runningCount: session.runningCount,
         errorCount: session.errorCount > 0 || Boolean(session.historyError) ? 1 : 0,
-        updatedAtMs: sessionUpdatedAtMs(session),
-        updatedAt: session.updatedAt,
+        updatedAtMs: sessionActivityAtMs(session),
+        updatedAt: session.activityAt ?? session.updatedAt,
       })
       continue
     }
@@ -2030,21 +2118,15 @@ function buildAgentSessionGroups(sessions: GatewaySessionActivity[]): AgentSessi
       existing.errorCount += 1
     }
 
-    const updatedMs = sessionUpdatedAtMs(session)
+    const updatedMs = sessionActivityAtMs(session)
     if (updatedMs > existing.updatedAtMs) {
       existing.updatedAtMs = updatedMs
-      existing.updatedAt = session.updatedAt
+      existing.updatedAt = session.activityAt ?? session.updatedAt
     }
   }
 
   const groups = Array.from(map.values())
-  groups.sort((left, right) => {
-    const rankDiff = groupRank(left) - groupRank(right)
-    if (rankDiff !== 0) {
-      return rankDiff
-    }
-    return right.updatedAtMs - left.updatedAtMs
-  })
+  groups.sort((left, right) => right.updatedAtMs - left.updatedAtMs)
 
   return groups
 }

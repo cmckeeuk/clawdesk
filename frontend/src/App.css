@@ -520,6 +520,10 @@
   border-bottom: 1px solid var(--oc-color-border-soft);
 }
 
+.sessions-monitor-search-input {
+  width: 100%;
+}
+
 .sessions-center-action-row {
   display: flex;
   flex-wrap: wrap;
@@ -1711,6 +1715,8 @@
   border-radius: var(--oc-radius-md);
   margin-top: var(--oc-space-3);
   padding: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
   transition: border-color var(--oc-transition-fast), background-color var(--oc-transition-fast);
 }
 
